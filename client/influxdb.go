@@ -1,7 +1,8 @@
-package client
+package client // import "github.com/influxdata/influxdb/client"
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb/models"
 )
 
 const (
@@ -79,6 +80,7 @@ type Config struct {
 	UserAgent string
 	Timeout   time.Duration
 	Precision string
+	UnsafeSsl bool
 }
 
 // NewConfig will create a config to be used in connecting to the client
@@ -114,11 +116,19 @@ const (
 
 // NewClient will instantiate and return a connected client to issue commands to the server.
 func NewClient(c Config) (*Client, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: c.UnsafeSsl,
+	}
+
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
 	client := Client{
 		url:        c.URL,
 		username:   c.Username,
 		password:   c.Password,
-		httpClient: &http.Client{Timeout: c.Timeout},
+		httpClient: &http.Client{Timeout: c.Timeout, Transport: tr},
 		userAgent:  c.UserAgent,
 		precision:  c.Precision,
 	}
@@ -196,6 +206,10 @@ func (c *Client) Write(bp BatchPoints) (*Response, error) {
 
 	var b bytes.Buffer
 	for _, p := range bp.Points {
+		err := checkPointTypes(p)
+		if err != nil {
+			return nil, err
+		}
 		if p.Raw != "" {
 			if _, err := b.WriteString(p.Raw); err != nil {
 				return nil, err
@@ -640,6 +654,19 @@ func (bp *BatchPoints) UnmarshalJSON(b []byte) error {
 // Addr provides the current url as a string of the server the client is connected to.
 func (c *Client) Addr() string {
 	return c.url.String()
+}
+
+// checkPointTypes ensures no unsupported types are submitted to influxdb, returning error if they are found.
+func checkPointTypes(p Point) error {
+	for _, v := range p.Fields {
+		switch v.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, float32, float64, bool, string, nil:
+			return nil
+		default:
+			return fmt.Errorf("unsupported point type: %T", v)
+		}
+	}
+	return nil
 }
 
 // helper functions

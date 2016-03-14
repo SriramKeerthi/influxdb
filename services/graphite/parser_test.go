@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/services/graphite"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/graphite"
 )
 
 func BenchmarkParse(b *testing.B) {
@@ -61,6 +61,13 @@ func TestTemplateApply(t *testing.T) {
 			tags:        map[string]string{"hostname": "server01", "region": "us-west"},
 		},
 		{
+			test:        "metric with multiple tags",
+			input:       "server01.example.org.cpu.us-west",
+			template:    "hostname.hostname.hostname.measurement.region",
+			measurement: "cpu",
+			tags:        map[string]string{"hostname": "server01.example.org", "region": "us-west"},
+		},
+		{
 			test: "no metric",
 			tags: make(map[string]string),
 			err:  `no measurement specified for template. ""`,
@@ -92,6 +99,13 @@ func TestTemplateApply(t *testing.T) {
 			template:    ".zone..measurement*",
 			measurement: "cpu.load",
 			tags:        map[string]string{"zone": "us-west"},
+		},
+		{
+			test:        "conjoined fields",
+			input:       "prod.us-west.server01.cpu.util.idle.percent",
+			template:    "env.zone.host.measurement.measurement.field*",
+			measurement: "cpu.util",
+			tags:        map[string]string{"env": "prod", "zone": "us-west", "host": "server01"},
 		},
 	}
 
@@ -186,6 +200,12 @@ func TestParse(t *testing.T) {
 			template: "measurement",
 			err:      `field "cpu" time: strconv.ParseFloat: parsing "14199724z57825": invalid syntax`,
 		},
+		{
+			test:     "measurement* and field* (invalid)",
+			input:    `prod.us-west.server01.cpu.util.idle.percent 99.99 1419972457825`,
+			template: "env.zone.host.measurement*.field*",
+			err:      `either 'field*' or 'measurement*' can be used in each template (but not both together): "env.zone.host.measurement*.field*"`,
+		},
 	}
 
 	for _, test := range tests {
@@ -229,7 +249,7 @@ func TestParseNaN(t *testing.T) {
 		t.Fatalf("expected error. got nil")
 	}
 
-	if _, ok := err.(*graphite.ErrUnsupportedValue); !ok {
+	if _, ok := err.(*graphite.UnsupportedValueError); !ok {
 		t.Fatalf("expected *graphite.ErrUnsupportedValue, got %v", reflect.TypeOf(err))
 	}
 }
@@ -599,6 +619,27 @@ func TestApplyTemplateSpecific(t *testing.T) {
 	}
 	if service != "facebook" {
 		t.Errorf("Expected service='facebook' tag, got service='%s'", service)
+	}
+}
+
+// Test that most specific template is N/A
+func TestApplyTemplateSpecificIsNA(t *testing.T) {
+	o := graphite.Options{
+		Separator: "_",
+		Templates: []string{
+			"current.* measurement.service",
+			"current.*.*.test measurement.measurement.service",
+		},
+	}
+	p, err := graphite.NewParserWithOptions(o)
+	if err != nil {
+		t.Fatalf("unexpected error creating parser, got %v", err)
+	}
+
+	measurement, _, _, _ := p.ApplyTemplate("current.users.facebook")
+	if measurement != "current" {
+		t.Errorf("Parser.ApplyTemplate unexpected result. got %s, exp %s",
+			measurement, "current")
 	}
 }
 

@@ -14,14 +14,18 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/cmd/influxd/run"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/services/httpd"
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/client/v2"
+	"github.com/influxdata/influxdb/cmd/influxd/run"
+	"github.com/influxdata/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/toml"
 )
+
+const emptyResults = `{"results":[{}]}`
 
 // Server represents a test wrapper for run.Server.
 type Server struct {
@@ -41,13 +45,14 @@ func NewServer(c *run.Config) *Server {
 		Server: srv,
 		Config: c,
 	}
-	s.TSDBStore.EngineOptions.Config = c.Data
-	configureLogging(&s)
 	return &s
 }
 
 // OpenServer opens a test server.
 func OpenServer(c *run.Config, joinURLs string) *Server {
+	if len(joinURLs) > 0 {
+		c.Meta.JoinPeers = strings.Split(joinURLs, ",")
+	}
 	s := NewServer(c)
 	configureLogging(s)
 	if err := s.Open(); err != nil {
@@ -63,15 +68,16 @@ func OpenServerWithVersion(c *run.Config, version string) *Server {
 		Commit:  "",
 		Branch:  "",
 	}
+	fmt.Println(">>> ", c.Data.Enabled)
 	srv, _ := run.NewServer(c, buildInfo)
 	s := Server{
 		Server: srv,
 		Config: c,
 	}
-	configureLogging(&s)
 	if err := s.Open(); err != nil {
 		panic(err.Error())
 	}
+	configureLogging(&s)
 
 	return &s
 }
@@ -82,7 +88,7 @@ func OpenDefaultServer(c *run.Config, joinURLs string) *Server {
 	if err := s.CreateDatabaseAndRetentionPolicy("db0", newRetentionPolicyInfo("rp0", 1, 0)); err != nil {
 		panic(err)
 	}
-	if err := s.MetaStore.SetDefaultRetentionPolicy("db0", "rp0"); err != nil {
+	if err := s.MetaClient.SetDefaultRetentionPolicy("db0", "rp0"); err != nil {
 		panic(err)
 	}
 	return s
@@ -90,10 +96,18 @@ func OpenDefaultServer(c *run.Config, joinURLs string) *Server {
 
 // Close shuts down the server and removes all temporary paths.
 func (s *Server) Close() {
-	s.Server.Close()
-	os.RemoveAll(s.Config.Meta.Dir)
-	os.RemoveAll(s.Config.Data.Dir)
-	os.RemoveAll(s.Config.HintedHandoff.Dir)
+	if err := s.Server.Close(); err != nil {
+		panic(err.Error())
+	}
+	if err := os.RemoveAll(s.Config.Meta.Dir); err != nil {
+		panic(err.Error())
+	}
+	if err := os.RemoveAll(s.Config.Data.Dir); err != nil {
+		panic(err.Error())
+	}
+	if err := os.RemoveAll(s.Config.HintedHandoff.Dir); err != nil {
+		panic(err.Error())
+	}
 }
 
 // URL returns the base URL for the httpd endpoint.
@@ -108,9 +122,9 @@ func (s *Server) URL() string {
 
 // CreateDatabaseAndRetentionPolicy will create the database and retention policy.
 func (s *Server) CreateDatabaseAndRetentionPolicy(db string, rp *meta.RetentionPolicyInfo) error {
-	if _, err := s.MetaStore.CreateDatabase(db); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(db); err != nil {
 		return err
-	} else if _, err := s.MetaStore.CreateRetentionPolicy(db, rp); err != nil {
+	} else if _, err := s.MetaClient.CreateRetentionPolicy(db, rp); err != nil {
 		return err
 	}
 	return nil
@@ -121,13 +135,34 @@ func (s *Server) Query(query string) (results string, err error) {
 	return s.QueryWithParams(query, nil)
 }
 
+// MustQuery executes a query against the server and returns the results.
+func (s *Server) MustQuery(query string) string {
+	results, err := s.Query(query)
+	if err != nil {
+		panic(err)
+	}
+	return results
+}
+
 // Query executes a query against the server and returns the results.
 func (s *Server) QueryWithParams(query string, values url.Values) (results string, err error) {
+	var v url.Values
 	if values == nil {
-		values = url.Values{}
+		v = url.Values{}
+	} else {
+		v, _ = url.ParseQuery(values.Encode())
 	}
-	values.Set("q", query)
-	return s.HTTPGet(s.URL() + "/query?" + values.Encode())
+	v.Set("q", query)
+	return s.HTTPGet(s.URL() + "/query?" + v.Encode())
+}
+
+// MustQueryWithParams executes a query against the server and returns the results.
+func (s *Server) MustQueryWithParams(query string, values url.Values) string {
+	results, err := s.QueryWithParams(query, values)
+	if err != nil {
+		panic(err)
+	}
+	return results
 }
 
 // HTTPGet makes an HTTP GET request to the server and returns the response.
@@ -208,10 +243,15 @@ func NewConfig() *run.Config {
 	c.Cluster.WriteTimeout = toml.Duration(30 * time.Second)
 	c.Meta.Dir = MustTempFile()
 	c.Meta.BindAddress = "127.0.0.1:0"
+	c.Meta.HTTPBindAddress = "127.0.0.1:0"
 	c.Meta.HeartbeatTimeout = toml.Duration(50 * time.Millisecond)
 	c.Meta.ElectionTimeout = toml.Duration(50 * time.Millisecond)
 	c.Meta.LeaderLeaseTimeout = toml.Duration(50 * time.Millisecond)
 	c.Meta.CommitTimeout = toml.Duration(5 * time.Millisecond)
+
+	if !testing.Verbose() {
+		c.Meta.LoggingEnabled = false
+	}
 
 	c.Data.Dir = MustTempFile()
 	c.Data.WALDir = MustTempFile()
@@ -294,6 +334,7 @@ type Query struct {
 	pattern  bool
 	skip     bool
 	repeat   int
+	once     bool
 }
 
 // Execute runs the command and returns an err if it fails
@@ -318,12 +359,38 @@ func (q *Query) Error(err error) string {
 }
 
 func (q *Query) failureMessage() string {
-	return fmt.Sprintf("%s: unexpected results\nquery:  %s\nexp:    %s\nactual: %s\n", q.name, q.command, q.exp, q.act)
+	return fmt.Sprintf("%s: unexpected results\nquery:  %s\nparams:  %v\nexp:    %s\nactual: %s\n", q.name, q.command, q.params, q.exp, q.act)
 }
+
+type Write struct {
+	db   string
+	rp   string
+	data string
+}
+
+func (w *Write) duplicate() *Write {
+	return &Write{
+		db:   w.db,
+		rp:   w.rp,
+		data: w.data,
+	}
+}
+
+type Writes []*Write
+
+func (a Writes) duplicate() Writes {
+	writes := make(Writes, 0, len(a))
+	for _, w := range a {
+		writes = append(writes, w.duplicate())
+	}
+	return writes
+}
+
+type Tests map[string]Test
 
 type Test struct {
 	initialized bool
-	write       string
+	writes      Writes
 	params      url.Values
 	db          string
 	rp          string
@@ -338,20 +405,89 @@ func NewTest(db, rp string) Test {
 	}
 }
 
+func (t Test) duplicate() Test {
+	test := Test{
+		initialized: t.initialized,
+		writes:      t.writes.duplicate(),
+		db:          t.db,
+		rp:          t.rp,
+		exp:         t.exp,
+		queries:     make([]*Query, len(t.queries)),
+	}
+
+	if t.params != nil {
+		t.params = url.Values{}
+		for k, a := range t.params {
+			vals := make([]string, len(a))
+			copy(vals, a)
+			test.params[k] = vals
+		}
+	}
+	copy(test.queries, t.queries)
+	return test
+}
+
 func (t *Test) addQueries(q ...*Query) {
 	t.queries = append(t.queries, q...)
 }
 
+func (t *Test) database() string {
+	if t.db != "" {
+		return t.db
+	}
+	return "db0"
+}
+
+func (t *Test) retentionPolicy() string {
+	if t.rp != "" {
+		return t.rp
+	}
+	return "default"
+}
+
 func (t *Test) init(s *Server) error {
-	if t.write == "" || t.initialized {
+	if len(t.writes) == 0 || t.initialized {
 		return nil
 	}
-	t.initialized = true
-	if res, err := s.Write(t.db, t.rp, t.write, t.params); err != nil {
-		return err
-	} else if t.exp != res {
-		return fmt.Errorf("unexpected results\nexp: %s\ngot: %s\n", t.exp, res)
+	if t.db == "" {
+		t.db = "db0"
 	}
+	if t.rp == "" {
+		t.rp = "rp0"
+	}
+
+	if err := writeTestData(s, t); err != nil {
+		return err
+	}
+
+	t.initialized = true
+
+	return nil
+}
+
+func writeTestData(s *Server, t *Test) error {
+	for i, w := range t.writes {
+		if w.db == "" {
+			w.db = t.database()
+		}
+		if w.rp == "" {
+			w.rp = t.retentionPolicy()
+		}
+
+		if err := s.CreateDatabaseAndRetentionPolicy(w.db, newRetentionPolicyInfo(w.rp, 1, 0)); err != nil {
+			return err
+		}
+		if err := s.MetaClient.SetDefaultRetentionPolicy(w.db, w.rp); err != nil {
+			return err
+		}
+
+		if res, err := s.Write(w.db, w.rp, w.data, t.params); err != nil {
+			return fmt.Errorf("write #%d: %s", i, err)
+		} else if t.exp != res {
+			return fmt.Errorf("unexpected results\nexp: %s\ngot: %s\n", t.exp, res)
+		}
+	}
+
 	return nil
 }
 
@@ -362,16 +498,208 @@ func configureLogging(s *Server) {
 			SetLogger(*log.Logger)
 		}
 		nullLogger := log.New(ioutil.Discard, "", 0)
-		s.MetaStore.Logger = nullLogger
 		s.TSDBStore.Logger = nullLogger
 		s.HintedHandoff.SetLogger(nullLogger)
 		s.Monitor.SetLogger(nullLogger)
-		s.QueryExecutor.SetLogger(nullLogger)
+		s.QueryExecutor.LogOutput = ioutil.Discard
 		s.Subscriber.SetLogger(nullLogger)
 		for _, service := range s.Services {
 			if service, ok := service.(logSetter); ok {
 				service.SetLogger(nullLogger)
 			}
+		}
+	}
+}
+
+type Cluster struct {
+	Servers []*Server
+}
+
+func NewCluster(size int) (*Cluster, error) {
+	c := Cluster{}
+	c.Servers = append(c.Servers, OpenServer(NewConfig(), ""))
+	metaServiceAddr := c.Servers[0].MetaServers()[0]
+
+	for i := 1; i < size; i++ {
+		c.Servers = append(c.Servers, OpenServer(NewConfig(), metaServiceAddr))
+	}
+
+	for _, s := range c.Servers {
+		configureLogging(s)
+	}
+
+	if err := verifyCluster(&c, size); err != nil {
+		return nil, err
+	}
+
+	return &c, nil
+}
+
+func verifyCluster(c *Cluster, size int) error {
+	r, err := c.Servers[0].Query("SHOW SERVERS")
+	if err != nil {
+		return err
+	}
+	var cl client.Response
+	if e := json.Unmarshal([]byte(r), &cl); e != nil {
+		return e
+	}
+
+	// grab only the meta nodes series
+	series := cl.Results[0].Series[0]
+	for i, value := range series.Values {
+		addr := c.Servers[0].MetaServers()[0]
+		if value[0].(float64) != float64(i+1) {
+			return fmt.Errorf("expected nodeID %d, got %v", i, value[0])
+		}
+		if value[1].(string) != addr {
+			return fmt.Errorf("expected addr %s, got %v", addr, value[1])
+		}
+	}
+
+	return nil
+}
+
+func NewClusterWithDefaults(size int) (*Cluster, error) {
+	c, err := NewCluster(size)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := c.Query(&Query{command: "CREATE DATABASE db0"})
+	if err != nil {
+		return nil, err
+	}
+	if r != emptyResults {
+		return nil, fmt.Errorf("%s", r)
+	}
+
+	for i, s := range c.Servers {
+		got, err := s.Query("SHOW DATABASES")
+		if err != nil {
+			return nil, fmt.Errorf("failed to query databases on node %d for show databases", i+1)
+		}
+		if exp := `{"results":[{"series":[{"name":"databases","columns":["name"],"values":[["db0"]]}]}]}`; got != exp {
+			return nil, fmt.Errorf("unexpected result node %d\nexp: %s\ngot: %s\n", i+1, exp, got)
+		}
+	}
+
+	return c, nil
+}
+
+func NewClusterCustom(size int, cb func(index int, config *run.Config)) (*Cluster, error) {
+	c := Cluster{}
+
+	config := NewConfig()
+	cb(0, config)
+
+	c.Servers = append(c.Servers, OpenServer(config, ""))
+	metaServiceAddr := c.Servers[0].MetaServers()[0]
+
+	for i := 1; i < size; i++ {
+		config := NewConfig()
+		cb(i, config)
+		c.Servers = append(c.Servers, OpenServer(config, metaServiceAddr))
+	}
+
+	for _, s := range c.Servers {
+		configureLogging(s)
+	}
+
+	if err := verifyCluster(&c, size); err != nil {
+		return nil, err
+	}
+
+	return &c, nil
+}
+
+// Close shuts down all servers.
+func (c *Cluster) Close() {
+	var wg sync.WaitGroup
+	wg.Add(len(c.Servers))
+
+	for _, s := range c.Servers {
+		go func(s *Server) {
+			defer wg.Done()
+			s.Close()
+		}(s)
+	}
+	wg.Wait()
+}
+
+func (c *Cluster) Query(q *Query) (string, error) {
+	r, e := c.Servers[0].Query(q.command)
+	q.act = r
+	return r, e
+}
+
+func (c *Cluster) QueryIndex(index int, q string) (string, error) {
+	return c.Servers[index].Query(q)
+}
+
+func (c *Cluster) QueryAll(q *Query) error {
+	type Response struct {
+		Val string
+		Err error
+	}
+
+	timeoutErr := fmt.Errorf("timed out waiting for response")
+
+	queryAll := func() error {
+		// if a server doesn't return in 5 seconds, fail the response
+		timeout := time.After(5 * time.Second)
+		ch := make(chan Response, 0)
+
+		for _, s := range c.Servers {
+			go func(s *Server) {
+				r, err := s.QueryWithParams(q.command, q.params)
+				ch <- Response{Val: r, Err: err}
+			}(s)
+		}
+
+		resps := []Response{}
+		for i := 0; i < len(c.Servers); i++ {
+			select {
+			case r := <-ch:
+				resps = append(resps, r)
+			case <-timeout:
+				return timeoutErr
+			}
+		}
+
+		for _, r := range resps {
+			if r.Err != nil {
+				return r.Err
+			}
+			if q.pattern {
+				if !expectPattern(q.exp, r.Val) {
+					return fmt.Errorf("unexpected pattern: \n\texp: %s\n\tgot: %s\n", q.exp, r.Val)
+				}
+			} else {
+				if r.Val != q.exp {
+					return fmt.Errorf("unexpected value:\n\texp: %s\n\tgot: %s\n", q.exp, r.Val)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	tick := time.Tick(100 * time.Millisecond)
+	// if we don't reach consensus in 20 seconds, fail the query
+	timeout := time.After(20 * time.Second)
+
+	if err := queryAll(); err == nil {
+		return nil
+	}
+	for {
+		select {
+		case <-tick:
+			if err := queryAll(); err == nil {
+				return nil
+			}
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for response")
 		}
 	}
 }

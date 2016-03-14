@@ -13,13 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/influxql"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/services/httpd"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/client"
+	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 func TestBatchWrite_UnmarshalEpoch(t *testing.T) {
@@ -136,7 +135,7 @@ func TestBatchWrite_UnmarshalRFC(t *testing.T) {
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_Query(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
 		if q.String() != `SELECT * FROM bar` {
 			t.Fatalf("unexpected query: %s", q.String())
 		} else if db != `foo` {
@@ -146,7 +145,7 @@ func TestHandler_Query(t *testing.T) {
 			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
 			&influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})},
 			nil,
-		), nil
+		)
 	}
 
 	w := httptest.NewRecorder()
@@ -161,15 +160,13 @@ func TestHandler_Query(t *testing.T) {
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_QueryRegex(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
 		if q.String() != `SELECT * FROM test WHERE url =~ /http\:\/\/www.akamai\.com/` {
 			t.Fatalf("unexpected query: %s", q.String())
 		} else if db != `test` {
 			t.Fatalf("unexpected db: %s", db)
 		}
-		return NewResultChan(
-			nil,
-		), nil
+		return NewResultChan(nil)
 	}
 
 	w := httptest.NewRecorder()
@@ -179,11 +176,11 @@ func TestHandler_QueryRegex(t *testing.T) {
 // Ensure the handler merges results from the same statement.
 func TestHandler_Query_MergeResults(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
 		return NewResultChan(
 			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
 			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-		), nil
+		)
 	}
 
 	w := httptest.NewRecorder()
@@ -195,17 +192,36 @@ func TestHandler_Query_MergeResults(t *testing.T) {
 	}
 }
 
+// Ensure the handler merges results from the same statement.
+func TestHandler_Query_MergeEmptyResults(t *testing.T) {
+	h := NewHandler(false)
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
+		return NewResultChan(
+			&influxql.Result{StatementID: 1, Series: models.Rows{}},
+			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
+		)
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?db=foo&q=SELECT+*+FROM+bar", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", w.Code)
+	} else if w.Body.String() != `{"results":[{"series":[{"name":"series1"}]}]}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+}
+
 // Ensure the handler can parse chunked and chunk size query parameters.
 func TestHandler_Query_Chunked(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
 		if chunkSize != 2 {
 			t.Fatalf("unexpected chunk size: %d", chunkSize)
 		}
 		return NewResultChan(
 			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
 			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-		), nil
+		)
 	}
 
 	w := httptest.NewRecorder()
@@ -255,25 +271,11 @@ func TestHandler_Query_ErrInvalidQuery(t *testing.T) {
 // 	}
 // }
 
-// Ensure the handler returns a status 500 if an error is returned from the query executor.
-func TestHandler_Query_ErrExecuteQuery(t *testing.T) {
-	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return nil, errors.New("marker")
-	}
-
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?db=foo&q=SHOW+SERIES+FROM+bar", nil))
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-}
-
 // Ensure the handler returns a status 200 if an error is returned in the result.
 func TestHandler_Query_ErrResult(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return NewResultChan(&influxql.Result{Err: errors.New("measurement not found")}), nil
+	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
+		return NewResultChan(&influxql.Result{Err: errors.New("measurement not found")})
 	}
 
 	w := httptest.NewRecorder()
@@ -286,6 +288,7 @@ func TestHandler_Query_ErrResult(t *testing.T) {
 }
 
 // Ensure the handler handles ping requests correctly.
+// TODO: This should be expanded to verify the MetaClient check in servePing is working correctly
 func TestHandler_Ping(t *testing.T) {
 	h := NewHandler(false)
 	w := httptest.NewRecorder()
@@ -299,47 +302,54 @@ func TestHandler_Ping(t *testing.T) {
 	}
 }
 
-// Ensure the handler handles ping requests correctly, when waiting for leader.
-func TestHandler_PingWaitForLeader(t *testing.T) {
+// Ensure the handler returns the version correctly from the different endpoints.
+func TestHandler_Version(t *testing.T) {
 	h := NewHandler(false)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("unexpected status: %d", w.Code)
+	tests := []struct {
+		method   string
+		endpoint string
+		body     io.Reader
+	}{
+		{
+			method:   "GET",
+			endpoint: "/ping",
+			body:     nil,
+		},
+		{
+			method:   "GET",
+			endpoint: "/query?db=foo&q=SELECT+*+FROM+bar",
+			body:     nil,
+		},
+		{
+			method:   "POST",
+			endpoint: "/write",
+			body:     bytes.NewReader(make([]byte, 10)),
+		},
 	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("unexpected status: %d", w.Code)
+
+	for _, test := range tests {
+		h.ServeHTTP(w, MustNewRequest(test.method, test.endpoint, test.body))
+		if v, ok := w.HeaderMap["X-Influxdb-Version"]; ok {
+			if v[0] != "0.0.0" {
+				t.Fatalf("unexpected version: %s", v)
+			}
+		} else {
+			t.Fatalf("Header entry 'X-Influxdb-Version' not present")
+		}
 	}
 }
 
-// Ensure the handler handles ping requests correctly, when timeout expires waiting for leader.
-func TestHandler_PingWaitForLeaderTimeout(t *testing.T) {
-	h := NewHandler(false)
-	h.MetaStore.WaitForLeaderFn = func(d time.Duration) error {
-		return fmt.Errorf("timeout")
-	}
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-}
-
-// Ensure the handler handles bad ping requests
-func TestHandler_PingWaitForLeaderBadRequest(t *testing.T) {
+// Ensure the handler handles status requests correctly.
+func TestHandler_Status(t *testing.T) {
 	h := NewHandler(false)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1xxx", nil))
-	if w.Code != http.StatusBadRequest {
+	h.ServeHTTP(w, MustNewRequest("GET", "/status", nil))
+	if w.Code != http.StatusNoContent {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=abc", nil))
-	if w.Code != http.StatusBadRequest {
+	h.ServeHTTP(w, MustNewRequest("HEAD", "/status", nil))
+	if w.Code != http.StatusNoContent {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
 }
@@ -449,37 +459,36 @@ func TestNormalizeBatchPoints(t *testing.T) {
 // NewHandler represents a test wrapper for httpd.Handler.
 type Handler struct {
 	*httpd.Handler
-	MetaStore     HandlerMetaStore
+	MetaClient    HandlerMetaStore
 	QueryExecutor HandlerQueryExecutor
-	TSDBStore     HandlerTSDBStore
 }
 
 // NewHandler returns a new instance of Handler.
 func NewHandler(requireAuthentication bool) *Handler {
 	statMap := influxdb.NewStatistics("httpd", "httpd", nil)
 	h := &Handler{
-		Handler: httpd.NewHandler(requireAuthentication, true, false, statMap),
+		Handler: httpd.NewHandler(requireAuthentication, true, false, false, statMap),
 	}
-	h.Handler.MetaStore = &h.MetaStore
+	h.Handler.MetaClient = &h.MetaClient
 	h.Handler.QueryExecutor = &h.QueryExecutor
 	h.Handler.Version = "0.0.0"
 	return h
 }
 
-// HandlerMetaStore is a mock implementation of Handler.MetaStore.
+// HandlerMetaStore is a mock implementation of Handler.MetaClient.
 type HandlerMetaStore struct {
-	WaitForLeaderFn func(d time.Duration) error
-	DatabaseFn      func(name string) (*meta.DatabaseInfo, error)
-	AuthenticateFn  func(username, password string) (ui *meta.UserInfo, err error)
-	UsersFn         func() ([]meta.UserInfo, error)
+	PingFn         func(d time.Duration) error
+	DatabaseFn     func(name string) (*meta.DatabaseInfo, error)
+	AuthenticateFn func(username, password string) (ui *meta.UserInfo, err error)
+	UsersFn        func() []meta.UserInfo
 }
 
-func (s *HandlerMetaStore) WaitForLeader(d time.Duration) error {
-	if s.WaitForLeaderFn == nil {
+func (s *HandlerMetaStore) Ping(b bool) error {
+	if s.PingFn == nil {
 		// Default behaviour is to assume there is a leader.
 		return nil
 	}
-	return s.WaitForLeaderFn(d)
+	return s.Ping(b)
 }
 
 func (s *HandlerMetaStore) Database(name string) (*meta.DatabaseInfo, error) {
@@ -490,31 +499,22 @@ func (s *HandlerMetaStore) Authenticate(username, password string) (ui *meta.Use
 	return s.AuthenticateFn(username, password)
 }
 
-func (s *HandlerMetaStore) Users() ([]meta.UserInfo, error) {
+func (s *HandlerMetaStore) Users() []meta.UserInfo {
 	return s.UsersFn()
 }
 
 // HandlerQueryExecutor is a mock implementation of Handler.QueryExecutor.
 type HandlerQueryExecutor struct {
 	AuthorizeFn    func(u *meta.UserInfo, q *influxql.Query, db string) error
-	ExecuteQueryFn func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error)
+	ExecuteQueryFn func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result
 }
 
 func (e *HandlerQueryExecutor) Authorize(u *meta.UserInfo, q *influxql.Query, db string) error {
 	return e.AuthorizeFn(u, q, db)
 }
 
-func (e *HandlerQueryExecutor) ExecuteQuery(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
+func (e *HandlerQueryExecutor) ExecuteQuery(q *influxql.Query, db string, chunkSize int, closing chan struct{}) <-chan *influxql.Result {
 	return e.ExecuteQueryFn(q, db, chunkSize, closing)
-}
-
-// HandlerTSDBStore is a mock implementation of Handler.TSDBStore
-type HandlerTSDBStore struct {
-	CreateMapperFn func(shardID uint64, query string, chunkSize int) (tsdb.Mapper, error)
-}
-
-func (h *HandlerTSDBStore) CreateMapper(shardID uint64, query string, chunkSize int) (tsdb.Mapper, error) {
-	return h.CreateMapperFn(shardID, query, chunkSize)
 }
 
 // MustNewRequest returns a new HTTP request. Panic on error.

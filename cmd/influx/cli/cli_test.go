@@ -3,15 +3,18 @@ package cli_test
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/cmd/influx/cli"
+	"github.com/influxdata/influxdb/client"
+	"github.com/influxdata/influxdb/cmd/influx/cli"
+	"github.com/influxdata/influxdb/influxql"
 	"github.com/peterh/liner"
 )
 
@@ -43,26 +46,30 @@ func TestRunCLI(t *testing.T) {
 	c := cli.New(CLIENT_VERSION)
 	c.Host = h
 	c.Port, _ = strconv.Atoi(p)
-	c.Run()
+	c.IgnoreSignals = true
+	go func() {
+		close(c.Quit)
+	}()
+	if err := c.Run(); err != nil {
+		t.Fatalf("Run failed with error: %s", err)
+	}
 }
 
-func TestConnect(t *testing.T) {
+func TestRunCLI_ExecuteInsert(t *testing.T) {
 	t.Parallel()
 	ts := emptyTestServer()
 	defer ts.Close()
 
 	u, _ := url.Parse(ts.URL)
-	cmd := "connect " + u.Host
-	c := cli.CommandLine{}
-
-	// assert connection is established
-	if err := c.Connect(cmd); err != nil {
-		t.Fatalf("There was an error while connecting to %s: %s", u.Path, err)
-	}
-
-	// assert server version is populated
-	if c.ServerVersion != SERVER_VERSION {
-		t.Fatalf("Server version is %s but should be %s.", c.ServerVersion, SERVER_VERSION)
+	h, p, _ := net.SplitHostPort(u.Host)
+	c := cli.New(CLIENT_VERSION)
+	c.Host = h
+	c.Port, _ = strconv.Atoi(p)
+	c.Precision = "ms"
+	c.Execute = "INSERT sensor,floor=1 value=2"
+	c.IgnoreSignals = true
+	if err := c.Run(); err != nil {
+		t.Fatalf("Run failed with error: %s", err)
 	}
 }
 
@@ -153,35 +160,46 @@ func TestSetWriteConsistency(t *testing.T) {
 
 func TestParseCommand_CommandsExist(t *testing.T) {
 	t.Parallel()
-	c := cli.CommandLine{}
+	c, err := client.NewClient(client.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	m := cli.CommandLine{Client: c, Line: liner.NewLiner()}
 	tests := []struct {
 		cmd string
 	}{
 		{cmd: "gopher"},
-		{cmd: "connect"},
+		{cmd: "auth"},
 		{cmd: "help"},
-		{cmd: "pretty"},
-		{cmd: "use"},
+		{cmd: "format"},
+		{cmd: "precision"},
+		{cmd: "settings"},
 	}
 	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command failed for %q.`, test.cmd)
+		if err := m.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil`, err, test.cmd)
 		}
 	}
 }
 
-func TestParseCommand_BlankCommand(t *testing.T) {
+func TestParseCommand_Connect(t *testing.T) {
 	t.Parallel()
+	ts := emptyTestServer()
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	cmd := "connect " + u.Host
 	c := cli.CommandLine{}
-	tests := []struct {
-		cmd string
-	}{
-		{cmd: ""}, // test that a blank command doesn't work
+
+	// assert connection is established
+	if err := c.ParseCommand(cmd); err != nil {
+		t.Fatalf("There was an error while connecting to %v: %v", u.Path, err)
 	}
-	for _, test := range tests {
-		if c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command failed for %q.`, test.cmd)
-		}
+
+	// assert server version is populated
+	if c.ServerVersion != SERVER_VERSION {
+		t.Fatalf("Server version is %s but should be %s.", c.ServerVersion, SERVER_VERSION)
 	}
 }
 
@@ -222,9 +240,40 @@ func TestParseCommand_Exit(t *testing.T) {
 	}
 }
 
+func TestParseCommand_Quit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		cmd string
+	}{
+		{cmd: "quit"},
+		{cmd: " quit"},
+		{cmd: "quit "},
+		{cmd: "Quit "},
+	}
+
+	for _, test := range tests {
+		c := cli.CommandLine{Quit: make(chan struct{}, 1)}
+		c.ParseCommand(test.cmd)
+		// channel should be closed
+		if _, ok := <-c.Quit; ok {
+			t.Fatalf(`Command "quit" failed for %q.`, test.cmd)
+		}
+	}
+}
+
 func TestParseCommand_Use(t *testing.T) {
 	t.Parallel()
-	c := cli.CommandLine{}
+	ts := emptyTestServer()
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	config := client.Config{URL: *u}
+	c, err := client.NewClient(config)
+	if err != nil {
+		t.Fatalf("unexpected error.  expected %v, actual %v", nil, err)
+	}
+	m := cli.CommandLine{Client: c}
+
 	tests := []struct {
 		cmd string
 	}{
@@ -237,12 +286,12 @@ func TestParseCommand_Use(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "use" failed for %q.`, test.cmd)
+		if err := m.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil.`, err, test.cmd)
 		}
 
-		if c.Database != "db" {
-			t.Fatalf(`Command "use" changed database to %q. Expected db`, c.Database)
+		if m.Database != "db" {
+			t.Fatalf(`Command "use" changed database to %q. Expected db`, m.Database)
 		}
 	}
 }
@@ -262,8 +311,8 @@ func TestParseCommand_Consistency(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "consistency" failed for %q.`, test.cmd)
+		if err := c.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil.`, err, test.cmd)
 		}
 
 		if c.WriteConsistency != "one" {
@@ -299,8 +348,8 @@ func TestParseCommand_Insert(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if !m.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "insert" failed for %q.`, test.cmd)
+		if err := m.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil.`, err, test.cmd)
 		}
 	}
 }
@@ -354,8 +403,8 @@ func TestParseCommand_InsertInto(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if !m.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "insert into" failed for %q.`, test.cmd)
+		if err := m.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil.`, err, test.cmd)
 		}
 		if m.Database != test.db {
 			t.Fatalf(`Command "insert into" db parsing failed, expected: %q, actual: %q`, test.db, m.Database)
@@ -384,8 +433,8 @@ func TestParseCommand_History(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "history" failed for %q.`, test.cmd)
+		if err := c.ParseCommand(test.cmd); err != nil {
+			t.Fatalf(`Got error %v for command %q, expected nil.`, err, test.cmd)
 		}
 	}
 
@@ -407,18 +456,21 @@ func TestParseCommand_HistoryWithBlankCommand(t *testing.T) {
 
 	tests := []struct {
 		cmd string
+		err error
 	}{
 		{cmd: "history"},
 		{cmd: " history"},
 		{cmd: "history "},
-		{cmd: "History "},
-		{cmd: ""},  // shouldn't be persisted in history
-		{cmd: " "}, // shouldn't be persisted in history
+		{cmd: "", err: cli.ErrBlankCommand},      // shouldn't be persisted in history
+		{cmd: " ", err: cli.ErrBlankCommand},     // shouldn't be persisted in history
+		{cmd: "     ", err: cli.ErrBlankCommand}, // shouldn't be persisted in history
 	}
 
-	// don't validate because blank commands are never executed
+	// a blank command will return cli.ErrBlankCommand.
 	for _, test := range tests {
-		c.ParseCommand(test.cmd)
+		if err := c.ParseCommand(test.cmd); err != test.err {
+			t.Errorf(`Got error %v for command %q, expected %v`, err, test.cmd, test.err)
+		}
 	}
 
 	// buf shall not contain empty commands
@@ -426,7 +478,7 @@ func TestParseCommand_HistoryWithBlankCommand(t *testing.T) {
 	c.Line.WriteHistory(&buf)
 	scanner := bufio.NewScanner(&buf)
 	for scanner.Scan() {
-		if scanner.Text() == "" || scanner.Text() == " " {
+		if strings.TrimSpace(scanner.Text()) == "" {
 			t.Fatal("Empty commands should not be persisted in history.")
 		}
 	}
@@ -437,6 +489,26 @@ func TestParseCommand_HistoryWithBlankCommand(t *testing.T) {
 func emptyTestServer() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Influxdb-Version", SERVER_VERSION)
-		return
+
+		switch r.URL.Path {
+		case "/query":
+			values := r.URL.Query()
+			parser := influxql.NewParser(bytes.NewBufferString(values.Get("q")))
+			q, err := parser.ParseQuery()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			stmt := q.Statements[0]
+
+			switch stmt.(type) {
+			case *influxql.ShowDatabasesStatement:
+				io.WriteString(w, `{"results":[{"series":[{"name":"databases","columns":["name"],"values":[["db"]]}]}]}`)
+			case *influxql.ShowDiagnosticsStatement:
+				io.WriteString(w, `{"results":[{}]}`)
+			}
+		case "/write":
+			w.WriteHeader(http.StatusOK)
+		}
 	}))
 }

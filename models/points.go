@@ -1,8 +1,9 @@
-package models
+package models // import "github.com/influxdata/influxdb/models"
 
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -11,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/pkg/escape"
+	"github.com/influxdata/influxdb/pkg/escape"
 )
 
 var (
@@ -25,6 +26,8 @@ var (
 		' ': []byte(`\ `),
 		'=': []byte(`\=`),
 	}
+
+	ErrPointMustHaveAField = errors.New("point without fields is unsupported")
 )
 
 // Point defines the values that will be written to the database
@@ -37,7 +40,6 @@ type Point interface {
 	SetTags(tags Tags)
 
 	Fields() Fields
-	AddField(name string, value interface{})
 
 	Time() time.Time
 	SetTime(t time.Time)
@@ -127,6 +129,13 @@ func ParsePoints(buf []byte) ([]Point, error) {
 // buffer.
 func ParsePointsString(buf string) ([]Point, error) {
 	return ParsePoints([]byte(buf))
+}
+
+// ParseKey returns the measurement name and tags from a point.
+func ParseKey(buf string) (string, Tags, error) {
+	_, keyBuf, err := scanKey([]byte(buf), 0)
+	tags := parseTags([]byte(buf))
+	return string(keyBuf), tags, err
 }
 
 // ParsePointsWithPrecision is similar to ParsePoints, but allows the
@@ -226,9 +235,30 @@ func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, err
 		if err != nil {
 			return nil, err
 		}
-		pt.time = time.Unix(0, ts*pt.GetPrecisionMultiplier(precision)).UTC()
+		pt.time, err = SafeCalcTime(ts, precision)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return pt, nil
+}
+
+// GetPrecisionMultiplier will return a multiplier for the precision specified
+func GetPrecisionMultiplier(precision string) int64 {
+	d := time.Nanosecond
+	switch precision {
+	case "u":
+		d = time.Microsecond
+	case "ms":
+		d = time.Millisecond
+	case "s":
+		d = time.Second
+	case "m":
+		d = time.Minute
+	case "h":
+		d = time.Hour
+	}
+	return int64(d)
 }
 
 // scanKey scans buf starting at i for the measurement and tag portion of the point.
@@ -428,7 +458,7 @@ func scanTagsKey(buf []byte, i int) (int, error) {
 // scanTagsValue scans each character in a tag value.
 func scanTagsValue(buf []byte, i int) (int, int, error) {
 	// Tag value cannot be empty.
-	if buf[i] == ',' || buf[i] == ' ' {
+	if i >= len(buf) || buf[i] == ',' || buf[i] == ' ' {
 		// cpu,tag={',', ' '}
 		return -1, i, fmt.Errorf("missing tag value")
 	}
@@ -507,20 +537,14 @@ func scanFields(buf []byte, i int) (int, []byte, error) {
 
 		// escaped characters?
 		if buf[i] == '\\' && i+1 < len(buf) {
-
-			// Is this an escape char within a string field? Only " and \ are allowed.
-			if quoted && (buf[i+1] == '"' || buf[i+1] == '\\') {
-				i += 2
-				continue
-				// Non-string field escaped chars
-			} else if !quoted && isFieldEscapeChar(buf[i+1]) {
-				i += 2
-				continue
-			}
+			i += 2
+			continue
 		}
 
 		// If the value is quoted, scan until we get to the end quote
-		if buf[i] == '"' {
+		// Only quote values in the field value since quotes are not significant
+		// in the field key
+		if buf[i] == '"' && equals > commas {
 			quoted = !quoted
 			i++
 			continue
@@ -806,10 +830,21 @@ func scanLine(buf []byte, i int) (int, []byte) {
 	start := i
 	quoted := false
 	fields := false
+
+	// tracks how many '=' and commas we've seen
+	// this duplicates some of the functionality in scanFields
+	equals := 0
+	commas := 0
 	for {
 		// reached the end of buf?
 		if i >= len(buf) {
 			break
+		}
+
+		// skip past escaped characters
+		if buf[i] == '\\' {
+			i += 2
+			continue
 		}
 
 		if buf[i] == ' ' {
@@ -817,10 +852,20 @@ func scanLine(buf []byte, i int) (int, []byte) {
 		}
 
 		// If we see a double quote, makes sure it is not escaped
-		if fields && buf[i] == '"' && (i-1 > 0 && buf[i-1] != '\\') {
-			i++
-			quoted = !quoted
-			continue
+		if fields {
+			if !quoted && buf[i] == '=' {
+				i++
+				equals++
+				continue
+			} else if !quoted && buf[i] == ',' {
+				i++
+				commas++
+				continue
+			} else if buf[i] == '"' && equals > commas {
+				i++
+				quoted = !quoted
+				continue
+			}
 		}
 
 		if buf[i] == '\n' && !quoted {
@@ -834,8 +879,10 @@ func scanLine(buf []byte, i int) (int, []byte) {
 }
 
 // scanTo returns the end position in buf and the next consecutive block
-// of bytes, starting from i and ending with stop byte.  If there are leading
-// spaces or escaped chars, they are skipped.
+// of bytes, starting from i and ending with stop byte, where stop byte
+// has not been escaped.
+//
+// If there are leading spaces, they are skipped.
 func scanTo(buf []byte, i int, stop byte) (int, []byte) {
 	start := i
 	for {
@@ -844,13 +891,8 @@ func scanTo(buf []byte, i int, stop byte) (int, []byte) {
 			break
 		}
 
-		if buf[i] == '\\' {
-			i += 2
-			continue
-		}
-
-		// reached end of block?
-		if buf[i] == stop {
+		// Reached unescaped stop value?
+		if buf[i] == stop && (i == 0 || buf[i-1] != '\\') {
 			break
 		}
 		i++
@@ -893,12 +935,7 @@ func scanTagValue(buf []byte, i int) (int, []byte) {
 			break
 		}
 
-		if buf[i] == '\\' {
-			i += 2
-			continue
-		}
-
-		if buf[i] == ',' {
+		if buf[i] == ',' && buf[i-1] != '\\' {
 			break
 		}
 		i++
@@ -951,14 +988,18 @@ func unescapeMeasurement(in []byte) []byte {
 
 func escapeTag(in []byte) []byte {
 	for b, esc := range tagEscapeCodes {
-		in = bytes.Replace(in, []byte{b}, esc, -1)
+		if bytes.Contains(in, []byte{b}) {
+			in = bytes.Replace(in, []byte{b}, esc, -1)
+		}
 	}
 	return in
 }
 
 func unescapeTag(in []byte) []byte {
 	for b, esc := range tagEscapeCodes {
-		in = bytes.Replace(in, esc, []byte{b}, -1)
+		if bytes.Contains(in, []byte{b}) {
+			in = bytes.Replace(in, esc, []byte{b}, -1)
+		}
 	}
 	return in
 }
@@ -1022,10 +1063,15 @@ func unescapeStringField(in string) string {
 }
 
 // NewPoint returns a new point with the given measurement name, tags, fields and timestamp.  If
-// an unsupported field value (NaN) is passed, this function returns an error.
+// an unsupported field value (NaN) or out of range time is passed, this function returns an error.
 func NewPoint(name string, tags Tags, fields Fields, time time.Time) (Point, error) {
 	if len(fields) == 0 {
-		return nil, fmt.Errorf("Point without fields is unsupported")
+		return nil, ErrPointMustHaveAField
+	}
+	if !time.IsZero() {
+		if err := CheckTime(time); err != nil {
+			return nil, err
+		}
 	}
 
 	for key, value := range fields {
@@ -1034,6 +1080,9 @@ func NewPoint(name string, tags Tags, fields Fields, time time.Time) (Point, err
 			if math.IsNaN(fv) {
 				return nil, fmt.Errorf("NaN is an unsupported value for field %s", key)
 			}
+		}
+		if len(key) == 0 {
+			return nil, fmt.Errorf("all fields must have non-empty names")
 		}
 	}
 
@@ -1044,10 +1093,14 @@ func NewPoint(name string, tags Tags, fields Fields, time time.Time) (Point, err
 	}, nil
 }
 
+// NewPointFromBytes returns a new Point from a marshalled Point.
 func NewPointFromBytes(b []byte) (Point, error) {
 	p := &point{}
 	if err := p.UnmarshalBinary(b); err != nil {
 		return nil, err
+	}
+	if len(p.Fields()) == 0 {
+		return nil, ErrPointMustHaveAField
 	}
 	return p, nil
 }
@@ -1106,10 +1159,14 @@ func (p *point) SetTime(t time.Time) {
 
 // Tags returns the tag set for the point
 func (p *point) Tags() Tags {
+	return parseTags(p.key)
+}
+
+func parseTags(buf []byte) Tags {
 	tags := map[string]string{}
 
-	if len(p.key) != 0 {
-		pos, name := scanTo(p.key, 0, ',')
+	if len(buf) != 0 {
+		pos, name := scanTo(buf, 0, ',')
 
 		// it's an empyt key, so there are no tags
 		if len(name) == 0 {
@@ -1119,11 +1176,11 @@ func (p *point) Tags() Tags {
 		i := pos + 1
 		var key, value []byte
 		for {
-			if i >= len(p.key) {
+			if i >= len(buf) {
 				break
 			}
-			i, key = scanTo(p.key, i, '=')
-			i, value = scanTagValue(p.key, i+1)
+			i, key = scanTo(buf, i, '=')
+			i, value = scanTagValue(buf, i+1)
 
 			if len(value) == 0 {
 				continue
@@ -1165,14 +1222,6 @@ func (p *point) Fields() Fields {
 	return p.cachedFields
 }
 
-// AddField adds or replaces a field value for a point
-func (p *point) AddField(name string, value interface{}) {
-	fields := p.Fields()
-	fields[name] = value
-	p.fields = fields.MarshalBinary()
-	p.cachedFields = nil
-}
-
 // SetPrecision will round a time to the specified precision
 func (p *point) SetPrecision(precision string) {
 	switch precision {
@@ -1190,24 +1239,6 @@ func (p *point) SetPrecision(precision string) {
 	}
 }
 
-// GetPrecisionMultiplier will return a multiplier for the precision specified
-func (p *point) GetPrecisionMultiplier(precision string) int64 {
-	d := time.Nanosecond
-	switch precision {
-	case "u":
-		d = time.Microsecond
-	case "ms":
-		d = time.Millisecond
-	case "s":
-		d = time.Second
-	case "m":
-		d = time.Minute
-	case "h":
-		d = time.Hour
-	}
-	return int64(d)
-}
-
 func (p *point) String() string {
 	if p.Time().IsZero() {
 		return string(p.Key()) + " " + string(p.fields)
@@ -1216,29 +1247,37 @@ func (p *point) String() string {
 }
 
 func (p *point) MarshalBinary() ([]byte, error) {
-	b := u32tob(uint32(len(p.Key())))
-	b = append(b, p.Key()...)
-
-	b = append(b, u32tob(uint32(len(p.fields)))...)
-	b = append(b, p.fields...)
-
 	tb, err := p.time.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
-	b = append(b, tb...)
+
+	b := make([]byte, 8+len(p.key)+len(p.fields)+len(tb))
+	i := 0
+
+	binary.BigEndian.PutUint32(b[i:], uint32(len(p.key)))
+	i += 4
+
+	i += copy(b[i:], p.key)
+
+	binary.BigEndian.PutUint32(b[i:i+4], uint32(len(p.fields)))
+	i += 4
+
+	i += copy(b[i:], p.fields)
+
+	copy(b[i:], tb)
 	return b, nil
 }
 
 func (p *point) UnmarshalBinary(b []byte) error {
 	var i int
-	keyLen := int(btou32(b[:4]))
+	keyLen := int(binary.BigEndian.Uint32(b[:4]))
 	i += int(4)
 
 	p.key = b[i : i+keyLen]
 	i += keyLen
 
-	fieldLen := int(btou32(b[i : i+4]))
+	fieldLen := int(binary.BigEndian.Uint32(b[i : i+4]))
 	i += int(4)
 
 	p.fields = b[i : i+fieldLen]
@@ -1254,7 +1293,7 @@ func (p *point) PrecisionString(precision string) string {
 		return fmt.Sprintf("%s %s", p.Key(), string(p.fields))
 	}
 	return fmt.Sprintf("%s %s %d", p.Key(), string(p.fields),
-		p.UnixNano()/p.GetPrecisionMultiplier(precision))
+		p.UnixNano()/GetPrecisionMultiplier(precision))
 }
 
 func (p *point) RoundedString(d time.Duration) string {
@@ -1365,38 +1404,37 @@ func newFieldsFromBinary(buf []byte) Fields {
 		}
 
 		i, name = scanTo(buf, i, '=')
-		if len(name) == 0 {
-			continue
-		}
 		name = escape.Unescape(name)
 
 		i, valueBuf = scanFieldValue(buf, i+1)
-		if len(valueBuf) == 0 {
-			fields[string(name)] = nil
-			continue
-		}
-
-		// If the first char is a double-quote, then unmarshal as string
-		if valueBuf[0] == '"' {
-			value = unescapeStringField(string(valueBuf[1 : len(valueBuf)-1]))
-			// Check for numeric characters and special NaN or Inf
-		} else if (valueBuf[0] >= '0' && valueBuf[0] <= '9') || valueBuf[0] == '-' || valueBuf[0] == '+' || valueBuf[0] == '.' ||
-			valueBuf[0] == 'N' || valueBuf[0] == 'n' || // NaN
-			valueBuf[0] == 'I' || valueBuf[0] == 'i' { // Inf
-
-			value, err = parseNumber(valueBuf)
-			if err != nil {
-				panic(fmt.Sprintf("unable to parse number value '%v': %v", string(valueBuf), err))
+		if len(name) > 0 {
+			if len(valueBuf) == 0 {
+				fields[string(name)] = nil
+				continue
 			}
 
-			// Otherwise parse it as bool
-		} else {
-			value, err = strconv.ParseBool(string(valueBuf))
-			if err != nil {
-				panic(fmt.Sprintf("unable to parse bool value '%v': %v\n", string(valueBuf), err))
+			// If the first char is a double-quote, then unmarshal as string
+			if valueBuf[0] == '"' {
+				value = unescapeStringField(string(valueBuf[1 : len(valueBuf)-1]))
+				// Check for numeric characters and special NaN or Inf
+			} else if (valueBuf[0] >= '0' && valueBuf[0] <= '9') || valueBuf[0] == '-' || valueBuf[0] == '+' || valueBuf[0] == '.' ||
+				valueBuf[0] == 'N' || valueBuf[0] == 'n' || // NaN
+				valueBuf[0] == 'I' || valueBuf[0] == 'i' { // Inf
+
+				value, err = parseNumber(valueBuf)
+				if err != nil {
+					panic(fmt.Sprintf("unable to parse number value '%v': %v", string(valueBuf), err))
+				}
+
+				// Otherwise parse it as bool
+			} else {
+				value, err = strconv.ParseBool(string(valueBuf))
+				if err != nil {
+					panic(fmt.Sprintf("unable to parse bool value '%v': %v\n", string(valueBuf), err))
+				}
 			}
+			fields[string(name)] = value
 		}
-		fields[string(name)] = value
 		i++
 	}
 	return fields
@@ -1496,14 +1534,4 @@ func (s *indexedSlice) Swap(i, j int) {
 
 func (s *indexedSlice) Len() int {
 	return len(s.indices)
-}
-
-func u32tob(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return b
-}
-
-func btou32(b []byte) uint32 {
-	return uint32(binary.BigEndian.Uint32(b))
 }

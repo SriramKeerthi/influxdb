@@ -5,33 +5,45 @@ import (
 	"net"
 	"time"
 
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"gopkg.in/fatih/pool.v2"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 const (
 	writeShardRequestMessage byte = iota + 1
 	writeShardResponseMessage
-	mapShardRequestMessage
-	mapShardResponseMessage
+
+	executeStatementRequestMessage
+	executeStatementResponseMessage
+
+	createIteratorRequestMessage
+	createIteratorResponseMessage
+
+	fieldDimensionsRequestMessage
+	fieldDimensionsResponseMessage
+
+	seriesKeysRequestMessage
+	seriesKeysResponseMessage
 )
 
 // ShardWriter writes a set of points to a shard.
 type ShardWriter struct {
-	pool    *clientPool
-	timeout time.Duration
+	pool           *clientPool
+	timeout        time.Duration
+	maxConnections int
 
-	MetaStore interface {
-		Node(id uint64) (ni *meta.NodeInfo, err error)
+	MetaClient interface {
+		DataNode(id uint64) (ni *meta.NodeInfo, err error)
+		ShardOwner(shardID uint64) (database, policy string, sgi *meta.ShardGroupInfo)
 	}
 }
 
 // NewShardWriter returns a new instance of ShardWriter.
-func NewShardWriter(timeout time.Duration) *ShardWriter {
+func NewShardWriter(timeout time.Duration, maxConnections int) *ShardWriter {
 	return &ShardWriter{
-		pool:    newClientPool(),
-		timeout: timeout,
+		pool:           newClientPool(),
+		timeout:        timeout,
+		maxConnections: maxConnections,
 	}
 }
 
@@ -42,7 +54,7 @@ func (w *ShardWriter) WriteShard(shardID, ownerID uint64, points []models.Point)
 		return err
 	}
 
-	conn, ok := c.(*pool.PoolConn)
+	conn, ok := c.(*pooledConn)
 	if !ok {
 		panic("wrong connection type")
 	}
@@ -50,9 +62,20 @@ func (w *ShardWriter) WriteShard(shardID, ownerID uint64, points []models.Point)
 		conn.Close() // return to pool
 	}(conn)
 
+	// Determine the location of this shard and whether it still exists
+	db, rp, sgi := w.MetaClient.ShardOwner(shardID)
+	if sgi == nil {
+		// If we can't get the shard group for this shard, then we need to drop this request
+		// as it is no longer valid.  This could happen if writes were queued via
+		// hinted handoff and we're processing the queue after a shard group was deleted.
+		return nil
+	}
+
 	// Build write request.
 	var request WriteShardRequest
 	request.SetShardID(shardID)
+	request.SetDatabase(db)
+	request.SetRetentionPolicy(rp)
 	request.AddPoints(points)
 
 	// Marshal into protocol buffers.
@@ -94,9 +117,9 @@ func (w *ShardWriter) dial(nodeID uint64) (net.Conn, error) {
 	_, ok := w.pool.getPool(nodeID)
 	if !ok {
 		factory := &connFactory{nodeID: nodeID, clientPool: w.pool, timeout: w.timeout}
-		factory.metaStore = w.MetaStore
+		factory.metaClient = w.MetaClient
 
-		p, err := pool.NewChannelPool(1, 3, factory.dial)
+		p, err := NewBoundedPool(1, w.maxConnections, w.timeout, factory.dial)
 		if err != nil {
 			return nil, err
 		}
@@ -130,8 +153,8 @@ type connFactory struct {
 		size() int
 	}
 
-	metaStore interface {
-		Node(id uint64) (ni *meta.NodeInfo, err error)
+	metaClient interface {
+		DataNode(id uint64) (ni *meta.NodeInfo, err error)
 	}
 }
 
@@ -140,7 +163,7 @@ func (c *connFactory) dial() (net.Conn, error) {
 		return nil, errMaxConnectionsExceeded
 	}
 
-	ni, err := c.metaStore.Node(c.nodeID)
+	ni, err := c.metaClient.DataNode(c.nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +172,7 @@ func (c *connFactory) dial() (net.Conn, error) {
 		return nil, fmt.Errorf("node %d does not exist", c.nodeID)
 	}
 
-	conn, err := net.DialTimeout("tcp", ni.Host, c.timeout)
+	conn, err := net.DialTimeout("tcp", ni.TCPHost, c.timeout)
 	if err != nil {
 		return nil, err
 	}

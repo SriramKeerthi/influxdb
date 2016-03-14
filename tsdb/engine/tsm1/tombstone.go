@@ -16,7 +16,7 @@ type Tombstoner struct {
 	Path string
 }
 
-func (t *Tombstoner) Add(key string) error {
+func (t *Tombstoner) Add(keys []string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -31,7 +31,9 @@ func (t *Tombstoner) Add(key string) error {
 		return nil
 	}
 
-	tombstones = append(tombstones, key)
+	for _, k := range keys {
+		tombstones = append(tombstones, k)
+	}
 
 	return t.writeTombstone(tombstones)
 }
@@ -46,6 +48,33 @@ func (t *Tombstoner) Delete() error {
 	if err := os.RemoveAll(t.tombstonePath()); err != nil {
 		return err
 	}
+	return nil
+}
+
+// HasTombstones return true if there are any tombstone entries recorded.
+func (t *Tombstoner) HasTombstones() bool {
+	stat, err := os.Stat(t.tombstonePath())
+	if err != nil {
+		return false
+	}
+
+	return stat.Size() > 0
+}
+
+// TombstoneFiles returns any tombstone files associated with this TSM file.
+func (t *Tombstoner) TombstoneFiles() []FileStat {
+	stat, err := os.Stat(t.tombstonePath())
+	if err != nil {
+		return nil
+	}
+
+	if stat.Size() > 0 {
+		return []FileStat{FileStat{
+			Path:         stat.Name(),
+			LastModified: stat.ModTime().UnixNano(),
+			Size:         uint32(stat.Size())}}
+	}
+
 	return nil
 }
 
@@ -65,17 +94,14 @@ func (t *Tombstoner) writeTombstone(tombstones []string) error {
 		return err
 	}
 
-	if err := os.Rename(tmp.Name(), t.tombstonePath()); err != nil {
+	tmpFilename := tmp.Name()
+	tmp.Close()
+
+	if err := os.Rename(tmpFilename, t.tombstonePath()); err != nil {
 		return err
 	}
 
-	// fsync the dir to flush the rename
-	dir, err := os.OpenFile(filepath.Dir(t.tombstonePath()), os.O_RDONLY, os.ModeDir)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return syncDir(filepath.Dir(t.tombstonePath()))
 }
 
 func (t *Tombstoner) readTombstone() ([]string, error) {

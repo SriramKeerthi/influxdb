@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
 )
 
 // NodeProcessor encapsulates a queue of hinted-handoff data for a node, and the
@@ -32,7 +32,7 @@ type NodeProcessor struct {
 	done chan struct{}
 
 	queue  *queue
-	meta   metaStore
+	meta   metaClient
 	writer shardWriter
 
 	statMap *expvar.Map
@@ -41,7 +41,7 @@ type NodeProcessor struct {
 
 // NewNodeProcessor returns a new NodeProcessor for the given node, using dir for
 // the hinted-handoff data.
-func NewNodeProcessor(nodeID uint64, dir string, w shardWriter, m metaStore) *NodeProcessor {
+func NewNodeProcessor(nodeID uint64, dir string, w shardWriter, m metaClient) *NodeProcessor {
 	key := strings.Join([]string{"hh_processor", dir}, ":")
 	tags := map[string]string{"node": fmt.Sprintf("%d", nodeID), "path": dir}
 
@@ -247,6 +247,7 @@ func (n *NodeProcessor) SendWrite() (int, error) {
 	return len(buf), nil
 }
 
+// Head returns the head of the processor's queue.
 func (n *NodeProcessor) Head() string {
 	qp, err := n.queue.Position()
 	if err != nil {
@@ -255,6 +256,7 @@ func (n *NodeProcessor) Head() string {
 	return qp.head
 }
 
+// Tail returns the tail of the processor's queue.
 func (n *NodeProcessor) Tail() string {
 	qp, err := n.queue.Position()
 	if err != nil {
@@ -265,7 +267,7 @@ func (n *NodeProcessor) Tail() string {
 
 // Active returns whether this node processor is for a currently active node.
 func (n *NodeProcessor) Active() (bool, error) {
-	nio, err := n.meta.Node(n.nodeID)
+	nio, err := n.meta.DataNode(n.nodeID)
 	if err != nil {
 		n.Logger.Printf("failed to determine if node %d is active: %s", n.nodeID, err.Error())
 		return false, err

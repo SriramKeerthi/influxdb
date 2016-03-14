@@ -1,4 +1,4 @@
-package udp
+package udp // import "github.com/influxdata/influxdb/services/udp"
 
 import (
 	"errors"
@@ -10,18 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 const (
-	// UDPBufferSize is the maximum UDP packet size
-	// see https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
-	UDPBufferSize = 65536
-
 	// Arbitrary, testing indicated that this doesn't typically get over 10
 	parserChanLen = 1000
 )
@@ -56,8 +52,8 @@ type Service struct {
 		WritePoints(p *cluster.WritePointsRequest) error
 	}
 
-	MetaStore interface {
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+	MetaClient interface {
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
 	}
 
 	Logger  *log.Logger
@@ -91,7 +87,7 @@ func (s *Service) Open() (err error) {
 		return errors.New("database has to be specified in config")
 	}
 
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.config.Database); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(s.config.Database); err != nil {
 		return errors.New("Failed to ensure target database exists")
 	}
 
@@ -163,7 +159,7 @@ func (s *Service) serve() {
 			return
 		default:
 			// Keep processing.
-			buf := make([]byte, UDPBufferSize)
+			buf := make([]byte, s.config.UDPPayloadSize)
 			n, _, err := s.conn.ReadFromUDP(buf)
 			if err != nil {
 				s.statMap.Add(statReadFail, 1)
@@ -184,11 +180,11 @@ func (s *Service) parser() {
 		case <-s.done:
 			return
 		case buf := <-s.parserChan:
-			points, err := models.ParsePoints(buf)
+			points, err := models.ParsePointsWithPrecision(buf, time.Now().UTC(), s.config.Precision)
 			if err != nil {
 				s.statMap.Add(statPointsParseFail, 1)
 				s.Logger.Printf("Failed to parse points: %s", err)
-				return
+				continue
 			}
 
 			for _, point := range points {

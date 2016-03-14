@@ -1,4 +1,4 @@
-package monitor
+package monitor // import "github.com/influxdata/influxdb/monitor"
 
 import (
 	"expvar"
@@ -11,55 +11,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/monitor/diagnostics"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 const leaderWaitTimeout = 30 * time.Second
 
+// Policy constants.
 const (
 	MonitorRetentionPolicy         = "monitor"
 	MonitorRetentionPolicyDuration = 7 * 24 * time.Hour
 )
-
-// DiagsClient is the interface modules implement if they register diags with monitor.
-type DiagsClient interface {
-	Diagnostics() (*Diagnostic, error)
-}
-
-// The DiagsClientFunc type is an adapter to allow the use of
-// ordinary functions as Diagnostis clients.
-type DiagsClientFunc func() (*Diagnostic, error)
-
-// Diagnostics calls f().
-func (f DiagsClientFunc) Diagnostics() (*Diagnostic, error) {
-	return f()
-}
-
-// Diagnostic represents a table of diagnostic information. The first value
-// is the name of the columns, the second is a slice of interface slices containing
-// the values for each column, by row. This information is never written to an InfluxDB
-// system and is display-only. An example showing, say, connections follows:
-//
-//     source_ip    source_port       dest_ip     dest_port
-//     182.1.0.2    2890              127.0.0.1   38901
-//     174.33.1.2   2924              127.0.0.1   38902
-type Diagnostic struct {
-	Columns []string
-	Rows    [][]interface{}
-}
-
-func NewDiagnostic(columns []string) *Diagnostic {
-	return &Diagnostic{
-		Columns: columns,
-		Rows:    make([][]interface{}, 0),
-	}
-}
-
-func (d *Diagnostic) AddRow(r []interface{}) {
-	d.Rows = append(d.Rows, r)
-}
 
 // Monitor represents an instance of the monitor system.
 type Monitor struct {
@@ -73,7 +37,7 @@ type Monitor struct {
 	done chan struct{}
 	mu   sync.Mutex
 
-	diagRegistrations map[string]DiagsClient
+	diagRegistrations map[string]diagnostics.Client
 
 	storeCreated           bool
 	storeEnabled           bool
@@ -84,19 +48,21 @@ type Monitor struct {
 	storeAddress           string
 	storeInterval          time.Duration
 
-	MetaStore interface {
-		ClusterID() (uint64, error)
-		NodeID() uint64
-		WaitForLeader(d time.Duration) error
-		IsLeader() bool
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
-		CreateRetentionPolicyIfNotExists(database string, rpi *meta.RetentionPolicyInfo) (*meta.RetentionPolicyInfo, error)
+	MetaClient interface {
+		ClusterID() uint64
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
+		CreateRetentionPolicy(database string, rpi *meta.RetentionPolicyInfo) (*meta.RetentionPolicyInfo, error)
 		SetDefaultRetentionPolicy(database, name string) error
 		DropRetentionPolicy(database, name string) error
 	}
 
+	NodeID uint64
+
+	// Writer for pushing stats back into the database.
+	// This causes a circular dependency if it depends on cluster directly so it
+	// is wrapped in a simpler interface.
 	PointsWriter interface {
-		WritePoints(p *cluster.WritePointsRequest) error
+		WritePoints(database, retentionPolicy string, points models.Points) error
 	}
 
 	Logger *log.Logger
@@ -105,12 +71,13 @@ type Monitor struct {
 // New returns a new instance of the monitor system.
 func New(c Config) *Monitor {
 	return &Monitor{
-		done:              make(chan struct{}),
-		diagRegistrations: make(map[string]DiagsClient),
-		storeEnabled:      c.StoreEnabled,
-		storeDatabase:     c.StoreDatabase,
-		storeInterval:     time.Duration(c.StoreInterval),
-		Logger:            log.New(os.Stderr, "[monitor] ", log.LstdFlags),
+		done:                 make(chan struct{}),
+		diagRegistrations:    make(map[string]diagnostics.Client),
+		storeEnabled:         c.StoreEnabled,
+		storeDatabase:        c.StoreDatabase,
+		storeInterval:        time.Duration(c.StoreInterval),
+		storeRetentionPolicy: MonitorRetentionPolicy,
+		Logger:               log.New(os.Stderr, "[monitor] ", log.LstdFlags),
 	}
 }
 
@@ -155,7 +122,7 @@ func (m *Monitor) SetLogger(l *log.Logger) {
 }
 
 // RegisterDiagnosticsClient registers a diagnostics client with the given name and tags.
-func (m *Monitor) RegisterDiagnosticsClient(name string, client DiagsClient) {
+func (m *Monitor) RegisterDiagnosticsClient(name string, client diagnostics.Client) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.diagRegistrations[name] = client
@@ -172,7 +139,7 @@ func (m *Monitor) DeregisterDiagnosticsClient(name string) {
 // Statistics returns the combined statistics for all expvar data. The given
 // tags are added to each of the returned statistics.
 func (m *Monitor) Statistics(tags map[string]string) ([]*Statistic, error) {
-	statistics := make([]*Statistic, 0)
+	var statistics []*Statistic
 
 	expvar.Do(func(kv expvar.KeyValue) {
 		// Skip built-in expvar stats.
@@ -281,11 +248,14 @@ func (m *Monitor) Statistics(tags map[string]string) ([]*Statistic, error) {
 	return statistics, nil
 }
 
-func (m *Monitor) Diagnostics() (map[string]*Diagnostic, error) {
+// Diagnostics fetches diagnostic information for each registered
+// diagnostic client. It skips any clients that return an error when
+// retrieving their diagnostics.
+func (m *Monitor) Diagnostics() (map[string]*diagnostics.Diagnostics, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	diags := make(map[string]*Diagnostic, len(m.diagRegistrations))
+	diags := make(map[string]*diagnostics.Diagnostics, len(m.diagRegistrations))
 	for k, v := range m.diagRegistrations {
 		d, err := v.Diagnostics()
 		if err != nil {
@@ -298,11 +268,11 @@ func (m *Monitor) Diagnostics() (map[string]*Diagnostic, error) {
 
 // createInternalStorage ensures the internal storage has been created.
 func (m *Monitor) createInternalStorage() {
-	if !m.MetaStore.IsLeader() || m.storeCreated {
+	if m.storeCreated {
 		return
 	}
 
-	if _, err := m.MetaStore.CreateDatabaseIfNotExists(m.storeDatabase); err != nil {
+	if _, err := m.MetaClient.CreateDatabase(m.storeDatabase); err != nil {
 		m.Logger.Printf("failed to create database '%s', failed to create storage: %s",
 			m.storeDatabase, err.Error())
 		return
@@ -311,19 +281,20 @@ func (m *Monitor) createInternalStorage() {
 	rpi := meta.NewRetentionPolicyInfo(MonitorRetentionPolicy)
 	rpi.Duration = MonitorRetentionPolicyDuration
 	rpi.ReplicaN = 1
-	if _, err := m.MetaStore.CreateRetentionPolicyIfNotExists(m.storeDatabase, rpi); err != nil {
+	if _, err := m.MetaClient.CreateRetentionPolicy(m.storeDatabase, rpi); err != nil {
 		m.Logger.Printf("failed to create retention policy '%s', failed to create internal storage: %s",
 			rpi.Name, err.Error())
 		return
 	}
 
-	if err := m.MetaStore.SetDefaultRetentionPolicy(m.storeDatabase, rpi.Name); err != nil {
+	if err := m.MetaClient.SetDefaultRetentionPolicy(m.storeDatabase, rpi.Name); err != nil {
 		m.Logger.Printf("failed to set default retention policy on '%s', failed to create internal storage: %s",
 			m.storeDatabase, err.Error())
 		return
 	}
 
-	if err := m.MetaStore.DropRetentionPolicy(m.storeDatabase, "default"); err != nil && err != meta.ErrRetentionPolicyNotFound {
+	err := m.MetaClient.DropRetentionPolicy(m.storeDatabase, "default")
+	if err != nil && err.Error() != influxdb.ErrRetentionPolicyNotFound("default").Error() {
 		m.Logger.Printf("failed to delete retention policy 'default', failed to created internal storage: %s", err.Error())
 		return
 	}
@@ -338,18 +309,12 @@ func (m *Monitor) storeStatistics() {
 	m.Logger.Printf("Storing statistics in database '%s' retention policy '%s', at interval %s",
 		m.storeDatabase, m.storeRetentionPolicy, m.storeInterval)
 
-	if err := m.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
-		m.Logger.Printf("failed to detect a cluster leader, terminating storage: %s", err.Error())
-		return
-	}
-
 	// Get cluster-level metadata. Nothing different is going to happen if errors occur.
-	clusterID, _ := m.MetaStore.ClusterID()
-	nodeID := m.MetaStore.NodeID()
+	clusterID := m.MetaClient.ClusterID()
 	hostname, _ := os.Hostname()
 	clusterTags := map[string]string{
 		"clusterID": fmt.Sprintf("%d", clusterID),
-		"nodeID":    fmt.Sprintf("%d", nodeID),
+		"nodeID":    fmt.Sprintf("%d", m.NodeID),
 		"hostname":  hostname,
 	}
 
@@ -376,13 +341,7 @@ func (m *Monitor) storeStatistics() {
 				points = append(points, pt)
 			}
 
-			err = m.PointsWriter.WritePoints(&cluster.WritePointsRequest{
-				Database:         m.storeDatabase,
-				RetentionPolicy:  m.storeRetentionPolicy,
-				ConsistencyLevel: cluster.ConsistencyLevelOne,
-				Points:           points,
-			})
-			if err != nil {
+			if err := m.PointsWriter.WritePoints(m.storeDatabase, m.storeRetentionPolicy, points); err != nil {
 				m.Logger.Printf("failed to store statistics: %s", err)
 			}
 		case <-m.done:
@@ -410,25 +369,25 @@ func newStatistic(name string, tags map[string]string, values map[string]interfa
 }
 
 // valueNames returns a sorted list of the value names, if any.
-func (s *Statistic) valueNames() []string {
+func (s *Statistic) ValueNames() []string {
 	a := make([]string, 0, len(s.Values))
-	for k, _ := range s.Values {
+	for k := range s.Values {
 		a = append(a, k)
 	}
 	sort.Strings(a)
 	return a
 }
 
-// DiagnosticFromMap returns a Diagnostic from a map.
-func DiagnosticFromMap(m map[string]interface{}) *Diagnostic {
+// DiagnosticsFromMap returns a Diagnostics from a map.
+func DiagnosticsFromMap(m map[string]interface{}) *diagnostics.Diagnostics {
 	// Display columns in deterministic order.
 	sortedKeys := make([]string, 0, len(m))
-	for k, _ := range m {
+	for k := range m {
 		sortedKeys = append(sortedKeys, k)
 	}
 	sort.Strings(sortedKeys)
 
-	d := NewDiagnostic(sortedKeys)
+	d := diagnostics.NewDiagnostics(sortedKeys)
 	row := make([]interface{}, len(sortedKeys))
 	for i, k := range sortedKeys {
 		row[i] = m[k]

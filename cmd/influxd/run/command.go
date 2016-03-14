@@ -67,12 +67,16 @@ func (cmd *Command) Run(args ...string) error {
 	// Print sweet InfluxDB logo.
 	fmt.Print(logo)
 
+	// Configure default logging.
+	log.SetPrefix("[run] ")
+	log.SetFlags(log.LstdFlags)
+
 	// Set parallelism.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Mark start-up in log.
-	log.Printf("InfluxDB starting, version %s, branch %s, commit %s, built %s",
-		cmd.Version, cmd.Branch, cmd.Commit, cmd.BuildTime)
+	log.Printf("InfluxDB starting, version %s, branch %s, commit %s",
+		cmd.Version, cmd.Branch, cmd.Commit)
 	log.Printf("Go version %s, GOMAXPROCS set to %d", runtime.Version(), runtime.GOMAXPROCS(0))
 
 	// Write the PID file.
@@ -94,14 +98,23 @@ func (cmd *Command) Run(args ...string) error {
 		return fmt.Errorf("apply env config: %v", err)
 	}
 
-	// Override config hostname if specified in the command line args.
-	if options.Hostname != "" {
-		config.Meta.Hostname = options.Hostname
+	// Propogate the top-level join options down to the meta config
+	if config.Join != "" {
+		config.Meta.JoinPeers = strings.Split(config.Join, ",")
 	}
 
+	// Command-line flags for -join and -hostname override the config
+	// and env variable
 	if options.Join != "" {
-		config.Meta.Peers = strings.Split(options.Join, ",")
+		config.Meta.JoinPeers = strings.Split(options.Join, ",")
 	}
+
+	if options.Hostname != "" {
+		config.Hostname = options.Hostname
+	}
+
+	// Propogate the top-level hostname down to dependendent configs
+	config.Meta.RemoteHostname = config.Hostname
 
 	// Validate the configuration.
 	if err := config.Validate(); err != nil {
@@ -160,8 +173,8 @@ func (cmd *Command) ParseFlags(args ...string) (Options, error) {
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	fs.StringVar(&options.ConfigPath, "config", "", "")
 	fs.StringVar(&options.PIDFile, "pidfile", "", "")
-	fs.StringVar(&options.Hostname, "hostname", "", "")
 	fs.StringVar(&options.Join, "join", "", "")
+	fs.StringVar(&options.Hostname, "hostname", "", "")
 	fs.StringVar(&options.CPUProfile, "cpuprofile", "", "")
 	fs.StringVar(&options.MemProfile, "memprofile", "", "")
 	fs.Usage = func() { fmt.Fprintln(cmd.Stderr, usage) }
@@ -214,30 +227,36 @@ func (cmd *Command) ParseConfig(path string) (*Config, error) {
 
 var usage = `usage: run [flags]
 
-run starts the broker and data node server. If this is the first time running
-the command then a new cluster will be initialized unless the -join argument
-is used.
+run starts the InfluxDB server. If this is the first time running the command
+then a new cluster will be initialized unless the -join argument is used.
 
         -config <path>
                           Set the path to the configuration file.
+
+        -join <host:port>
+                          Joins the server to an existing cluster. Should be
+                          the HTTP bind address of an existing meta server
 
         -hostname <name>
                           Override the hostname, the 'hostname' configuration
                           option will be overridden.
 
-        -join <url>
-                          Joins the server to an existing cluster.
-
         -pidfile <path>
                           Write process ID to a file.
+
+        -cpuprofile <path>
+                          Write CPU profiling information to a file.
+
+        -memprofile <path>
+                          Write memory usage information to a file.
 `
 
 // Options represents the command line options that can be parsed.
 type Options struct {
 	ConfigPath string
 	PIDFile    string
-	Hostname   string
 	Join       string
+	Hostname   string
 	CPUProfile string
 	MemProfile string
 }

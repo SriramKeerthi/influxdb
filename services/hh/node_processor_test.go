@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 type fakeShardWriter struct {
@@ -23,7 +23,7 @@ type fakeMetaStore struct {
 	NodeFn func(nodeID uint64) (*meta.NodeInfo, error)
 }
 
-func (f *fakeMetaStore) Node(nodeID uint64) (*meta.NodeInfo, error) {
+func (f *fakeMetaStore) DataNode(nodeID uint64) (*meta.NodeInfo, error) {
 	return f.NodeFn(nodeID)
 }
 
@@ -39,7 +39,7 @@ func TestNodeProcessorSendBlock(t *testing.T) {
 
 	sh := &fakeShardWriter{
 		ShardWriteFn: func(shardID, nodeID uint64, points []models.Point) error {
-			count += 1
+			count++
 			if shardID != expShardID {
 				t.Errorf("SendWrite() shardID mismatch: got %v, exp %v", shardID, expShardID)
 			}

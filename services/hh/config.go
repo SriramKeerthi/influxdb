@@ -1,9 +1,10 @@
 package hh
 
 import (
+	"errors"
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
@@ -34,6 +35,7 @@ const (
 	DefaultPurgeInterval = time.Hour
 )
 
+// Config is a hinted handoff configuration.
 type Config struct {
 	Enabled          bool          `toml:"enabled"`
 	Dir              string        `toml:"dir"`
@@ -45,6 +47,7 @@ type Config struct {
 	PurgeInterval    toml.Duration `toml:"purge-interval"`
 }
 
+// NewConfig returns a new Config.
 func NewConfig() Config {
 	return Config{
 		Enabled:          false,
@@ -55,4 +58,11 @@ func NewConfig() Config {
 		RetryMaxInterval: toml.Duration(DefaultRetryMaxInterval),
 		PurgeInterval:    toml.Duration(DefaultPurgeInterval),
 	}
+}
+
+func (c *Config) Validate() error {
+	if c.Enabled && c.Dir == "" {
+		return errors.New("HintedHandoff.Dir must be specified")
+	}
+	return nil
 }

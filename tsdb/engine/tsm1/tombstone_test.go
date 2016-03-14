@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/influxdb/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
 func TestTombstoner_Add(t *testing.T) {
@@ -23,7 +23,7 @@ func TestTombstoner_Add(t *testing.T) {
 		t.Fatalf("length mismatch: got %v, exp %v", got, exp)
 	}
 
-	ts.Add("foo")
+	ts.Add([]string{"foo"})
 
 	entries, err = ts.ReadAll()
 	if err != nil {
@@ -61,7 +61,7 @@ func TestTombstoner_Delete(t *testing.T) {
 	f := MustTempFile(dir)
 	ts := &tsm1.Tombstoner{Path: f.Name()}
 
-	ts.Add("foo")
+	ts.Add([]string{"foo"})
 
 	// Use a new Tombstoner to verify values are persisted
 	ts = &tsm1.Tombstoner{Path: f.Name()}

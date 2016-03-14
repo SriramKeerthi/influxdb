@@ -18,19 +18,22 @@ import (
 	"time"
 
 	"github.com/bmizerany/pat"
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/influxql"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/services/continuous_querier"
-	"github.com/influxdb/influxdb/uuid"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/client"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/continuous_querier"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/uuid"
 )
 
 const (
-	// With raw data queries, mappers will read up to this amount before sending results back to the engine.
-	// This is the default size in the number of values returned in a raw query. Could be many more bytes depending on fields returned.
+	// DefaultChunkSize specifies the amount of data mappers will read
+	// up to, before sending results back to the engine. This is the
+	// default size in the number of values returned in a raw query.
+	//
+	// Could be many more bytes depending on fields returned.
 	DefaultChunkSize = 10000
 )
 
@@ -54,17 +57,15 @@ type Handler struct {
 	requireAuthentication bool
 	Version               string
 
-	MetaStore interface {
-		WaitForLeader(timeout time.Duration) error
+	MetaClient interface {
 		Database(name string) (*meta.DatabaseInfo, error)
 		Authenticate(username, password string) (ui *meta.UserInfo, err error)
-		Users() ([]meta.UserInfo, error)
+		Users() []meta.UserInfo
+		Ping(checkAllMetaServers bool) error
 	}
 
-	QueryExecutor interface {
-		Authorize(u *meta.UserInfo, q *influxql.Query, db string) error
-		ExecuteQuery(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error)
-	}
+	QueryAuthorizer *meta.QueryAuthorizer
+	QueryExecutor   influxql.QueryExecutor
 
 	PointsWriter interface {
 		WritePoints(p *cluster.WritePointsRequest) error
@@ -72,20 +73,22 @@ type Handler struct {
 
 	ContinuousQuerier continuous_querier.ContinuousQuerier
 
-	Logger         *log.Logger
-	loggingEnabled bool // Log every HTTP access.
-	WriteTrace     bool // Detailed logging of write path
-	statMap        *expvar.Map
+	Logger           *log.Logger
+	loggingEnabled   bool // Log every HTTP access.
+	WriteTrace       bool // Detailed logging of write path
+	JSONWriteEnabled bool // Allow JSON writes
+	statMap          *expvar.Map
 }
 
 // NewHandler returns a new instance of handler with routes.
-func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, statMap *expvar.Map) *Handler {
+func NewHandler(requireAuthentication, loggingEnabled, writeTrace, JSONWriteEnabled bool, statMap *expvar.Map) *Handler {
 	h := &Handler{
 		mux: pat.New(),
 		requireAuthentication: requireAuthentication,
 		Logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
 		loggingEnabled:        loggingEnabled,
 		WriteTrace:            writeTrace,
+		JSONWriteEnabled:      JSONWriteEnabled,
 		statMap:               statMap,
 	}
 
@@ -114,6 +117,14 @@ func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, statMap 
 			"ping-head",
 			"HEAD", "/ping", true, true, h.servePing,
 		},
+		route{ // Ping w/ status
+			"status",
+			"GET", "/status", true, true, h.serveStatus,
+		},
+		route{ // Ping w/ status
+			"status-head",
+			"HEAD", "/status", true, true, h.serveStatus,
+		},
 		route{ // Tell data node to run CQs that should be run
 			"process_continuous_queries",
 			"POST", "/data/process_continuous_queries", false, false, h.serveProcessContinuousQueries,
@@ -123,6 +134,7 @@ func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, statMap 
 	return h
 }
 
+// SetRoutes sets the provided routes on the handler.
 func (h *Handler) SetRoutes(routes []route) {
 	for _, r := range routes {
 		var handler http.Handler
@@ -154,6 +166,8 @@ func (h *Handler) SetRoutes(routes []route) {
 // ServeHTTP responds to HTTP request to the handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.statMap.Add(statRequest, 1)
+	h.statMap.Add(statRequestsActive, 1)
+	start := time.Now()
 
 	// FIXME(benbjohnson): Add pprof enabled flag.
 	if strings.HasPrefix(r.URL.Path, "/debug/pprof") {
@@ -172,6 +186,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.mux.ServeHTTP(w, r)
 	}
+
+	h.statMap.Add(statRequestsActive, -1)
+	h.statMap.Add(statRequestDuration, time.Since(start).Nanoseconds())
 }
 
 func (h *Handler) serveProcessContinuousQueries(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
@@ -218,6 +235,9 @@ func (h *Handler) serveProcessContinuousQueries(w http.ResponseWriter, r *http.R
 // serveQuery parses an incoming query and, if valid, executes the query.
 func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
 	h.statMap.Add(statQueryRequest, 1)
+	defer func(start time.Time) {
+		h.statMap.Add(statQueryRequestDuration, time.Since(start).Nanoseconds())
+	}(time.Now())
 
 	q := r.URL.Query()
 	pretty := q.Get("pretty") == "true"
@@ -252,8 +272,10 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 
 	// Check authorization.
 	if h.requireAuthentication {
-		err = h.QueryExecutor.Authorize(user, query, db)
-		if err != nil {
+		if err := h.QueryAuthorizer.AuthorizeQuery(user, query, db); err != nil {
+			if err, ok := err.(meta.ErrAuthorize); ok {
+				h.Logger.Printf("unauthorized request | user: %q | query: %q | database %q\n", err.User, err.Query.String(), err.Database)
+			}
 			httpError(w, "error authorizing query: "+err.Error(), pretty, http.StatusUnauthorized)
 			return
 		}
@@ -280,12 +302,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 
 	// Execute query.
 	w.Header().Add("content-type", "application/json")
-	results, err := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, closing)
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, closing)
 
 	// if we're not chunking, this will be the in memory buffer for all results before sending to client
 	resp := Response{Results: make([]*influxql.Result, 0)}
@@ -324,17 +341,19 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 			resp.Results = append(resp.Results, r)
 		} else if resp.Results[l-1].StatementID == r.StatementID {
 			cr := resp.Results[l-1]
-			lastSeries := cr.Series[len(cr.Series)-1]
 			rowsMerged := 0
+			if len(cr.Series) > 0 {
+				lastSeries := cr.Series[len(cr.Series)-1]
 
-			for _, row := range r.Series {
-				if !lastSeries.SameSeries(row) {
-					// Next row is for a different series than last.
-					break
+				for _, row := range r.Series {
+					if !lastSeries.SameSeries(row) {
+						// Next row is for a different series than last.
+						break
+					}
+					// Values are for the same series, so append them.
+					lastSeries.Values = append(lastSeries.Values, row.Values...)
+					rowsMerged++
 				}
-				// Values are for the same series, so append them.
-				lastSeries.Values = append(lastSeries.Values, row.Values...)
-				rowsMerged++
 			}
 
 			// Append remaining rows as new rows.
@@ -354,25 +373,28 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 
 func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
 	h.statMap.Add(statWriteRequest, 1)
+	defer func(start time.Time) {
+		h.statMap.Add(statWriteRequestDuration, time.Since(start).Nanoseconds())
+	}(time.Now())
 
 	// Handle gzip decoding of the body
 	body := r.Body
 	if r.Header.Get("Content-encoding") == "gzip" {
 		b, err := gzip.NewReader(r.Body)
 		if err != nil {
-			h.writeError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+			resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 			return
 		}
+		defer b.Close()
 		body = b
 	}
-	defer body.Close()
 
 	b, err := ioutil.ReadAll(body)
 	if err != nil {
 		if h.WriteTrace {
 			h.Logger.Print("write handler unable to read bytes from request body")
 		}
-		h.writeError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+		resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		return
 	}
 	h.statMap.Add(statWriteRequestBytesReceived, int64(len(b)))
@@ -389,6 +411,11 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 
 // serveWriteJSON receives incoming series data in JSON and writes it to the database.
 func (h *Handler) serveWriteJSON(w http.ResponseWriter, r *http.Request, body []byte, user *meta.UserInfo) {
+	if !h.JSONWriteEnabled {
+		resultError(w, influxql.Result{Err: fmt.Errorf("JSON write protocol has been deprecated")}, http.StatusBadRequest)
+		return
+	}
+
 	var bp client.BatchPoints
 	var dec *json.Decoder
 
@@ -408,7 +435,7 @@ func (h *Handler) serveWriteJSON(w http.ResponseWriter, r *http.Request, body []
 		return
 	}
 
-	if di, err := h.MetaStore.Database(bp.Database); err != nil {
+	if di, err := h.MetaClient.Database(bp.Database); err != nil {
 		resultError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
 		return
 	} else if di == nil {
@@ -441,21 +468,15 @@ func (h *Handler) serveWriteJSON(w http.ResponseWriter, r *http.Request, body []
 	}); err != nil {
 		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
 		if influxdb.IsClientError(err) {
-			h.writeError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+			resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		} else {
-			h.writeError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
+			resultError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
 		}
 		return
 	}
 	h.statMap.Add(statPointsWrittenOK, int64(len(points)))
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, result influxql.Result, statusCode int) {
-	w.WriteHeader(statusCode)
-	w.Write([]byte(result.Err.Error()))
-	w.Write([]byte("\n"))
 }
 
 // serveWriteLine receives incoming series data in line protocol format and writes it to the database.
@@ -475,7 +496,7 @@ func (h *Handler) serveWriteLine(w http.ResponseWriter, r *http.Request, body []
 			if body[i] > 32 || i >= len(body)-1 {
 				break
 			}
-			i += 1
+			i++
 		}
 	}
 
@@ -491,31 +512,31 @@ func (h *Handler) serveWriteLine(w http.ResponseWriter, r *http.Request, body []
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		h.writeError(w, influxql.Result{Err: parseError}, http.StatusBadRequest)
+		resultError(w, influxql.Result{Err: parseError}, http.StatusBadRequest)
 		return
 	}
 
 	database := r.FormValue("db")
 	if database == "" {
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
+		resultError(w, influxql.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
 		return
 	}
 
-	if di, err := h.MetaStore.Database(database); err != nil {
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
+	if di, err := h.MetaClient.Database(database); err != nil {
+		resultError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
 		return
 	} else if di == nil {
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
+		resultError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
 		return
 	}
 
 	if h.requireAuthentication && user == nil {
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("user is required to write to database %q", database)}, http.StatusUnauthorized)
+		resultError(w, influxql.Result{Err: fmt.Errorf("user is required to write to database %q", database)}, http.StatusUnauthorized)
 		return
 	}
 
 	if h.requireAuthentication && !user.Authorize(influxql.WritePrivilege, database) {
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
+		resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
 		return
 	}
 
@@ -540,18 +561,18 @@ func (h *Handler) serveWriteLine(w http.ResponseWriter, r *http.Request, body []
 		Points:           points,
 	}); influxdb.IsClientError(err) {
 		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
-		h.writeError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+		resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		return
 	} else if err != nil {
 		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
-		h.writeError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
+		resultError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
 		return
 	} else if parseError != nil {
 		// We wrote some of the points
 		h.statMap.Add(statPointsWrittenOK, int64(len(points)))
 		// The other points failed to parse which means the client sent invalid line protocol.  We return a 400
 		// response code as well as the lines that failed to parse.
-		h.writeError(w, influxql.Result{Err: fmt.Errorf("partial write:\n%v", parseError)}, http.StatusBadRequest)
+		resultError(w, influxql.Result{Err: fmt.Errorf("partial write:\n%v", parseError)}, http.StatusBadRequest)
 		return
 	}
 
@@ -566,22 +587,19 @@ func (h *Handler) serveOptions(w http.ResponseWriter, r *http.Request) {
 
 // servePing returns a simple response to let the client know the server is running.
 func (h *Handler) servePing(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	wfl := q.Get("wait_for_leader")
+	h.statMap.Add(statPingRequest, 1)
+	w.WriteHeader(http.StatusNoContent)
+}
 
-	if wfl != "" {
-		d, err := time.ParseDuration(wfl)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if err := h.MetaStore.WaitForLeader(d); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
+// serveStatus returns a simple response to let the client know the whole cluster is running.
+func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
+	h.statMap.Add(statStatusRequest, 1)
+
+	if err := h.MetaClient.Ping(false); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 	}
 
-	h.statMap.Add(statPingRequest, 1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -627,6 +645,7 @@ func MarshalJSON(v interface{}, pretty bool) []byte {
 	return b
 }
 
+// Point represents an InfluxDB point.
 type Point struct {
 	Name   string                 `json:"name"`
 	Time   time.Time              `json:"time"`
@@ -634,6 +653,8 @@ type Point struct {
 	Fields map[string]interface{} `json:"fields"`
 }
 
+// Batch is a collection of points associated with a database, having a
+// certain retention policy.
 type Batch struct {
 	Database        string  `json:"database"`
 	RetentionPolicy string  `json:"retentionPolicy"`
@@ -710,11 +731,7 @@ func authenticate(inner func(http.ResponseWriter, *http.Request, *meta.UserInfo)
 		var user *meta.UserInfo
 
 		// Retrieve user list.
-		uis, err := h.MetaStore.Users()
-		if err != nil {
-			httpError(w, err.Error(), false, http.StatusInternalServerError)
-			return
-		}
+		uis := h.MetaClient.Users()
 
 		// TODO corylanou: never allow this in the future without users
 		if requireAuthentication && len(uis) > 0 {
@@ -730,7 +747,7 @@ func authenticate(inner func(http.ResponseWriter, *http.Request, *meta.UserInfo)
 				return
 			}
 
-			user, err = h.MetaStore.Authenticate(username, password)
+			user, err = h.MetaClient.Authenticate(username, password)
 			if err != nil {
 				h.statMap.Add(statAuthFail, 1)
 				httpError(w, err.Error(), false, http.StatusUnauthorized)
@@ -804,7 +821,7 @@ func cors(inner http.Handler) http.Handler {
 
 			w.Header().Set(`Access-Control-Expose-Headers`, strings.Join([]string{
 				`Date`,
-				`X-Influxdb-Version`,
+				`X-InfluxDB-Version`,
 			}, ", "))
 		}
 

@@ -13,8 +13,24 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
-	"github.com/influxdb/influxdb/tsdb"
-	"github.com/influxdb/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+)
+
+// these consts are for the old tsm format. They can be removed once we remove
+// the inspection for the original tsm1 files.
+const (
+	//IDsFileExtension is the extension for the file that keeps the compressed map
+	// of keys to uint64 IDs.
+	IDsFileExtension = "ids"
+
+	// FieldsFileExtension is the extension for the file that stores compressed field
+	// encoding data for this db
+	FieldsFileExtension = "fields"
+
+	// SeriesFileExtension is the extension for the file that stores the compressed
+	// series metadata for series in this db
+	SeriesFileExtension = "series"
 )
 
 type tsdmDumpOpts struct {
@@ -27,8 +43,8 @@ type tsdmDumpOpts struct {
 type tsmIndex struct {
 	series  int
 	offset  int64
-	minTime time.Time
-	maxTime time.Time
+	minTime int64
+	maxTime int64
 	blocks  []*block
 }
 
@@ -91,7 +107,7 @@ var (
 func readFields(path string) (map[string]*tsdb.MeasurementFields, error) {
 	fields := make(map[string]*tsdb.MeasurementFields)
 
-	f, err := os.OpenFile(filepath.Join(path, tsm1.FieldsFileExtension), os.O_RDONLY, 0666)
+	f, err := os.OpenFile(filepath.Join(path, FieldsFileExtension), os.O_RDONLY, 0666)
 	if os.IsNotExist(err) {
 		return fields, nil
 	} else if err != nil {
@@ -116,7 +132,7 @@ func readFields(path string) (map[string]*tsdb.MeasurementFields, error) {
 func readSeries(path string) (map[string]*tsdb.Series, error) {
 	series := make(map[string]*tsdb.Series)
 
-	f, err := os.OpenFile(filepath.Join(path, tsm1.SeriesFileExtension), os.O_RDONLY, 0666)
+	f, err := os.OpenFile(filepath.Join(path, SeriesFileExtension), os.O_RDONLY, 0666)
 	if os.IsNotExist(err) {
 		return series, nil
 	} else if err != nil {
@@ -141,7 +157,7 @@ func readSeries(path string) (map[string]*tsdb.Series, error) {
 }
 
 func readIds(path string) (map[string]uint64, error) {
-	f, err := os.OpenFile(filepath.Join(path, tsm1.IDsFileExtension), os.O_RDONLY, 0666)
+	f, err := os.OpenFile(filepath.Join(path, IDsFileExtension), os.O_RDONLY, 0666)
 	if os.IsNotExist(err) {
 		return nil, nil
 	} else if err != nil {
@@ -165,6 +181,7 @@ func readIds(path string) (map[string]uint64, error) {
 	}
 	return ids, err
 }
+
 func readIndex(f *os.File) (*tsmIndex, error) {
 	// Get the file size
 	stat, err := f.Stat()
@@ -185,12 +202,12 @@ func readIndex(f *os.File) (*tsmIndex, error) {
 	// Get the min time
 	f.Seek(-20, os.SEEK_END)
 	f.Read(b)
-	minTime := time.Unix(0, int64(btou64(b)))
+	minTime := int64(binary.BigEndian.Uint64(b))
 
 	// Get max time
 	f.Seek(-12, os.SEEK_END)
 	f.Read(b)
-	maxTime := time.Unix(0, int64(btou64(b)))
+	maxTime := int64(binary.BigEndian.Uint64(b))
 
 	// Figure out where the index starts
 	indexStart := stat.Size() - int64(seriesCount*12+20)
@@ -264,8 +281,8 @@ func cmdDumpTsm1(opts *tsdmDumpOpts) {
 		// Create a stubbed out index so we can still try and read the block data directly
 		// w/o panicing ourselves.
 		index = &tsmIndex{
-			minTime: time.Unix(0, 0),
-			maxTime: time.Unix(0, 0),
+			minTime: 0,
+			maxTime: 0,
 			offset:  stat.Size(),
 		}
 	}
@@ -275,10 +292,10 @@ func cmdDumpTsm1(opts *tsdmDumpOpts) {
 	println("Summary:")
 	fmt.Printf("  File: %s\n", opts.path)
 	fmt.Printf("  Time Range: %s - %s\n",
-		index.minTime.UTC().Format(time.RFC3339Nano),
-		index.maxTime.UTC().Format(time.RFC3339Nano),
+		time.Unix(0, index.minTime).UTC().Format(time.RFC3339Nano),
+		time.Unix(0, index.maxTime).UTC().Format(time.RFC3339Nano),
 	)
-	fmt.Printf("  Duration: %s ", index.maxTime.Sub(index.minTime))
+	fmt.Printf("  Duration: %s ", time.Unix(0, index.maxTime).Sub(time.Unix(0, index.minTime)))
 	fmt.Printf("  Series: %d ", index.series)
 	fmt.Printf("  File Size: %d\n", stat.Size())
 	println()
@@ -340,7 +357,7 @@ func cmdDumpTsm1(opts *tsdmDumpOpts) {
 		f.Seek(int64(i), 0)
 
 		f.Read(b)
-		id := btou64(b)
+		id := binary.BigEndian.Uint64(b)
 		f.Read(b[:4])
 		length := binary.BigEndian.Uint32(b[:4])
 		buf := make([]byte, length)
@@ -348,19 +365,13 @@ func cmdDumpTsm1(opts *tsdmDumpOpts) {
 
 		blockSize += int64(len(buf)) + 12
 
-		startTime := time.Unix(0, int64(btou64(buf[:8])))
+		startTime := time.Unix(0, int64(binary.BigEndian.Uint64(buf[:8])))
 		blockType := buf[8]
 
 		encoded := buf[9:]
 
-		var v []tsm1.Value
-		v, err := tsm1.DecodeBlock(buf, v)
-		if err != nil {
-			fmt.Printf("error: %v\n", err.Error())
-			os.Exit(1)
-		}
-
-		pointCount += int64(len(v))
+		cnt := tsm1.BlockCount(buf)
+		pointCount += int64(cnt)
 
 		// Length of the timestamp block
 		tsLen, j := binary.Uvarint(encoded)
@@ -393,7 +404,7 @@ func cmdDumpTsm1(opts *tsdmDumpOpts) {
 			strconv.FormatUint(id, 10),
 			typeDesc,
 			startTime.UTC().Format(time.RFC3339Nano),
-			strconv.FormatInt(int64(len(v)), 10),
+			strconv.FormatInt(int64(cnt), 10),
 			fmt.Sprintf("%s/%s", tsEncoding, vEncoding),
 			fmt.Sprintf("%d/%d", len(ts), len(values)),
 		}, "\t"))
@@ -459,7 +470,9 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 	}
 	b := make([]byte, 8)
 
-	r, err := tsm1.NewTSMReader(f)
+	r, err := tsm1.NewTSMReaderWithOptions(tsm1.TSMReaderOptions{
+		MMAPFile: f,
+	})
 	if err != nil {
 		println("Error opening TSM files: ", err.Error())
 	}
@@ -473,10 +486,10 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 	println("Summary:")
 	fmt.Printf("  File: %s\n", opts.path)
 	fmt.Printf("  Time Range: %s - %s\n",
-		minTime.UTC().Format(time.RFC3339Nano),
-		maxTime.UTC().Format(time.RFC3339Nano),
+		time.Unix(0, minTime).UTC().Format(time.RFC3339Nano),
+		time.Unix(0, maxTime).UTC().Format(time.RFC3339Nano),
 	)
-	fmt.Printf("  Duration: %s ", maxTime.Sub(minTime))
+	fmt.Printf("  Duration: %s ", time.Unix(0, maxTime).Sub(time.Unix(0, minTime)))
 	fmt.Printf("  Series: %d ", len(keys))
 	fmt.Printf("  File Size: %d\n", stat.Size())
 	println()
@@ -501,8 +514,8 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 			}
 			fmt.Fprintln(tw, "  "+strings.Join([]string{
 				strconv.FormatInt(int64(pos), 10),
-				e.MinTime.UTC().Format(time.RFC3339Nano),
-				e.MaxTime.UTC().Format(time.RFC3339Nano),
+				time.Unix(0, e.MinTime).UTC().Format(time.RFC3339Nano),
+				time.Unix(0, e.MaxTime).UTC().Format(time.RFC3339Nano),
 				strconv.FormatInt(int64(e.Offset), 10),
 				strconv.FormatInt(int64(e.Size), 10),
 				measurement,
@@ -532,17 +545,16 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 			f.Seek(int64(e.Offset), 0)
 			f.Read(b[:4])
 
-			chksum := btou32(b)
+			chksum := binary.BigEndian.Uint32(b[:4])
 
-			buf := make([]byte, e.Size)
+			buf := make([]byte, e.Size-4)
 			f.Read(buf)
 
-			blockSize += int64(len(buf)) + 4
+			blockSize += int64(e.Size)
 
-			startTime := time.Unix(0, int64(btou64(buf[:8])))
-			blockType := buf[8]
+			blockType := buf[0]
 
-			encoded := buf[9:]
+			encoded := buf[1:]
 
 			var v []tsm1.Value
 			v, err := tsm1.DecodeBlock(buf, v)
@@ -550,6 +562,7 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 				fmt.Printf("error: %v\n", err.Error())
 				os.Exit(1)
 			}
+			startTime := time.Unix(0, v[0].UnixNano())
 
 			pointCount += int64(len(v))
 
@@ -572,7 +585,7 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 			blockStats.size(len(buf))
 
 			if opts.filterKey != "" && !strings.Contains(key, opts.filterKey) {
-				i += (4 + int64(e.Size))
+				i += blockSize
 				blockCount++
 				continue
 			}
@@ -589,7 +602,7 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 				fmt.Sprintf("%d/%d", len(ts), len(values)),
 			}, "\t"))
 
-			i += (4 + int64(e.Size))
+			i += blockSize
 			blockCount++
 		}
 	}
@@ -600,10 +613,14 @@ func cmdDumpTsm1dev(opts *tsdmDumpOpts) {
 		println()
 	}
 
+	var blockSizeAvg int64
+	if blockCount > 0 {
+		blockSizeAvg = blockSize / blockCount
+	}
 	fmt.Printf("Statistics\n")
 	fmt.Printf("  Blocks:\n")
 	fmt.Printf("    Total: %d Size: %d Min: %d Max: %d Avg: %d\n",
-		blockCount, blockSize, blockStats.min, blockStats.max, blockSize/blockCount)
+		blockCount, blockSize, blockStats.min, blockStats.max, blockSizeAvg)
 	fmt.Printf("  Index:\n")
 	fmt.Printf("    Total: %d Size: %d\n", blockCount, indexSize)
 	fmt.Printf("  Points:\n")

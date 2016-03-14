@@ -3,7 +3,7 @@ package opentsdb
 import (
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
@@ -29,6 +29,7 @@ const (
 	DefaultBatchPending = 5
 )
 
+// Config represents the configuration of the OpenTSDB service.
 type Config struct {
 	Enabled          bool          `toml:"enabled"`
 	BindAddress      string        `toml:"bind-address"`
@@ -43,6 +44,7 @@ type Config struct {
 	LogPointErrors   bool          `toml:"log-point-errors"`
 }
 
+// NewConfig returns a new config for the service.
 func NewConfig() Config {
 	return Config{
 		BindAddress:      DefaultBindAddress,

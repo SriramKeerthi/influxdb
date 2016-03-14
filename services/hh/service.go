@@ -1,4 +1,4 @@
-package hh
+package hh // import "github.com/influxdata/influxdb/services/hh"
 
 import (
 	"expvar"
@@ -12,12 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/monitor"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/monitor/diagnostics"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
+// ErrHintedHandoffDisabled is returned when attempting to use a
+// disabled hinted handoff service.
 var ErrHintedHandoffDisabled = fmt.Errorf("hinted handoff disabled")
 
 const (
@@ -28,6 +30,7 @@ const (
 	writeNodeReqPoints  = "writeNodeReqPoints"
 )
 
+// Service represents a hinted handoff service.
 type Service struct {
 	mu      sync.RWMutex
 	wg      sync.WaitGroup
@@ -40,10 +43,10 @@ type Service struct {
 	cfg     Config
 
 	shardWriter shardWriter
-	metastore   metaStore
+	MetaClient  metaClient
 
 	Monitor interface {
-		RegisterDiagnosticsClient(name string, client monitor.DiagsClient)
+		RegisterDiagnosticsClient(name string, client diagnostics.Client)
 		DeregisterDiagnosticsClient(name string)
 	}
 }
@@ -52,12 +55,12 @@ type shardWriter interface {
 	WriteShard(shardID, ownerID uint64, points []models.Point) error
 }
 
-type metaStore interface {
-	Node(id uint64) (ni *meta.NodeInfo, err error)
+type metaClient interface {
+	DataNode(id uint64) (ni *meta.NodeInfo, err error)
 }
 
 // NewService returns a new instance of Service.
-func NewService(c Config, w shardWriter, m metaStore) *Service {
+func NewService(c Config, w shardWriter, m metaClient) *Service {
 	key := strings.Join([]string{"hh", c.Dir}, ":")
 	tags := map[string]string{"path": c.Dir}
 
@@ -68,10 +71,11 @@ func NewService(c Config, w shardWriter, m metaStore) *Service {
 		statMap:     influxdb.NewStatistics(key, "hh", tags),
 		Logger:      log.New(os.Stderr, "[handoff] ", log.LstdFlags),
 		shardWriter: w,
-		metastore:   m,
+		MetaClient:  m,
 	}
 }
 
+// Open opens the hinted handoff service.
 func (s *Service) Open() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -106,7 +110,7 @@ func (s *Service) Open() error {
 			continue
 		}
 
-		n := NewNodeProcessor(nodeID, s.pathforNode(nodeID), s.shardWriter, s.metastore)
+		n := NewNodeProcessor(nodeID, s.pathforNode(nodeID), s.shardWriter, s.MetaClient)
 		if err := n.Open(); err != nil {
 			return err
 		}
@@ -119,6 +123,7 @@ func (s *Service) Open() error {
 	return nil
 }
 
+// Close closes the hinted handoff service.
 func (s *Service) Close() error {
 	s.Logger.Println("shutting down hh service")
 	s.mu.Lock()
@@ -128,6 +133,10 @@ func (s *Service) Close() error {
 		if err := p.Close(); err != nil {
 			return err
 		}
+	}
+
+	if s.Monitor != nil {
+		s.Monitor.DeregisterDiagnosticsClient("hh")
 	}
 
 	if s.closing != nil {
@@ -163,7 +172,7 @@ func (s *Service) WriteShard(shardID, ownerID uint64, points []models.Point) err
 
 			processor, ok = s.processors[ownerID]
 			if !ok {
-				processor = NewNodeProcessor(ownerID, s.pathforNode(ownerID), s.shardWriter, s.metastore)
+				processor = NewNodeProcessor(ownerID, s.pathforNode(ownerID), s.shardWriter, s.MetaClient)
 				if err := processor.Open(); err != nil {
 					return err
 				}
@@ -183,11 +192,11 @@ func (s *Service) WriteShard(shardID, ownerID uint64, points []models.Point) err
 }
 
 // Diagnostics returns diagnostic information.
-func (s *Service) Diagnostics() (*monitor.Diagnostic, error) {
+func (s *Service) Diagnostics() (*diagnostics.Diagnostics, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	d := &monitor.Diagnostic{
+	d := &diagnostics.Diagnostics{
 		Columns: []string{"node", "active", "last modified", "head", "tail"},
 		Rows:    make([][]interface{}, 0, len(s.processors)),
 	}
@@ -198,13 +207,9 @@ func (s *Service) Diagnostics() (*monitor.Diagnostic, error) {
 			return nil, err
 		}
 
-		active := "no"
-		b, err := v.Active()
+		active, err := v.Active()
 		if err != nil {
 			return nil, err
-		}
-		if b {
-			active = "yes"
 		}
 
 		d.Rows = append(d.Rows, []interface{}{k, active, lm, v.Head(), v.Tail()})

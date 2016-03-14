@@ -51,6 +51,15 @@ func MustParseStatement(s string) Statement {
 // ParseExpr parses an expression string and returns its AST representation.
 func ParseExpr(s string) (Expr, error) { return NewParser(strings.NewReader(s)).ParseExpr() }
 
+// MustParseExpr parses an expression string and returns its AST. Panic on error.
+func MustParseExpr(s string) Expr {
+	expr, err := ParseExpr(s)
+	if err != nil {
+		panic(err.Error())
+	}
+	return expr
+}
+
 // ParseQuery parses an InfluxQL string and returns a Query AST object.
 func (p *Parser) ParseQuery() (*Query, error) {
 	var statements Statements
@@ -119,7 +128,7 @@ func (p *Parser) parseShowStatement() (Statement, error) {
 		if tok == KEYS {
 			return p.parseShowFieldKeysStatement()
 		}
-		return nil, newParseError(tokstr(tok, lit), []string{"KEYS", "VALUES"}, pos)
+		return nil, newParseError(tokstr(tok, lit), []string{"KEYS"}, pos)
 	case MEASUREMENTS:
 		return p.parseShowMeasurementsStatement()
 	case RETENTION:
@@ -220,8 +229,8 @@ func (p *Parser) parseDropStatement() (Statement, error) {
 		return p.parseDropRetentionPolicyStatement()
 	} else if tok == USER {
 		return p.parseDropUserStatement()
-	} else if tok == SERVER {
-		return p.parseDropServerStatement()
+	} else if tok == META || tok == DATA {
+		return p.parseDropServerStatement(tok)
 	} else if tok == SUBSCRIPTION {
 		return p.parseDropSubscriptionStatement()
 	}
@@ -510,7 +519,7 @@ func (p *Parser) parseUInt64() (uint64, error) {
 // This function assumes the DURATION token has already been consumed.
 func (p *Parser) parseDuration() (time.Duration, error) {
 	tok, pos, lit := p.scanIgnoreWhitespace()
-	if tok != DURATION_VAL && tok != INF {
+	if tok != DURATIONVAL && tok != INF {
 		return 0, newParseError(tokstr(tok, lit), []string{"duration"}, pos)
 	}
 
@@ -948,26 +957,30 @@ func (p *Parser) parseTarget(tr targetRequirement) (*Target, error) {
 // parseDeleteStatement parses a delete string and returns a DeleteStatement.
 // This function assumes the DELETE token has already been consumed.
 func (p *Parser) parseDeleteStatement() (*DeleteStatement, error) {
-	stmt := &DeleteStatement{}
+	// TODO remove and do not skip test once we wire up DELETE FROM.
+	// See issues https://github.com/influxdata/influxdb/issues/1647
+	// and https://github.com/influxdata/influxdb/issues/4404
+	return nil, errors.New("DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead")
+	//stmt := &DeleteStatement{}
 
-	// Parse source
-	if tok, pos, lit := p.scanIgnoreWhitespace(); tok != FROM {
-		return nil, newParseError(tokstr(tok, lit), []string{"FROM"}, pos)
-	}
-	source, err := p.parseSource()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Source = source
+	//// Parse source
+	//if tok, pos, lit := p.scanIgnoreWhitespace(); tok != FROM {
+	//	return nil, newParseError(tokstr(tok, lit), []string{"FROM"}, pos)
+	//}
+	//source, err := p.parseSource()
+	//if err != nil {
+	//	return nil, err
+	//}
+	//stmt.Source = source
 
-	// Parse condition: "WHERE EXPR".
-	condition, err := p.parseCondition()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Condition = condition
+	//// Parse condition: "WHERE EXPR".
+	//condition, err := p.parseCondition()
+	//if err != nil {
+	//	return nil, err
+	//}
+	//stmt.Condition = condition
 
-	return stmt, nil
+	//return stmt, nil
 }
 
 // parseShowSeriesStatement parses a string and returns a ShowSeriesStatement.
@@ -1304,21 +1317,23 @@ func (p *Parser) parseDropSeriesStatement() (*DropSeriesStatement, error) {
 }
 
 // parseDropServerStatement parses a string and returns a DropServerStatement.
-// This function assumes the "DROP SERVER" tokens have already been consumed.
-func (p *Parser) parseDropServerStatement() (*DropServerStatement, error) {
+// This function assumes the "DROP <META|DATA>" tokens have already been consumed.
+func (p *Parser) parseDropServerStatement(tok Token) (*DropServerStatement, error) {
+	// Parse the SERVER token
+	if tok, pos, lit := p.scanIgnoreWhitespace(); tok != SERVER {
+		return nil, newParseError(tokstr(tok, lit), []string{"SERVER"}, pos)
+	}
+
 	s := &DropServerStatement{}
 	var err error
+
+	if tok == META {
+		s.Meta = true
+	}
 
 	// Parse the server's ID.
 	if s.NodeID, err = p.parseUInt64(); err != nil {
 		return nil, err
-	}
-
-	// Parse optional FORCE token.
-	if tok, pos, lit := p.scanIgnoreWhitespace(); tok == FORCE {
-		s.Force = true
-	} else if tok != EOF && tok != SEMICOLON {
-		return nil, newParseError(tokstr(tok, lit), []string{"FORCE"}, pos)
 	}
 
 	return s, nil
@@ -1399,6 +1414,13 @@ func (p *Parser) parseCreateContinuousQueryStatement() (*CreateContinuousQuerySt
 	}
 	stmt.Database = ident
 
+	if p.parseTokenMaybe(RESAMPLE) {
+		stmt.ResampleEvery, stmt.ResampleFor, err = p.parseResample()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Expect a "BEGIN SELECT" tokens.
 	if err := p.parseTokens([]Token{BEGIN, SELECT}); err != nil {
 		return nil, err
@@ -1432,6 +1454,10 @@ func (p *Parser) parseCreateContinuousQueryStatement() (*CreateContinuousQuerySt
 		return nil, newParseError(tokstr(tok, lit), []string{"END"}, pos)
 	}
 
+	if err := stmt.validate(); err != nil {
+		return nil, err
+	}
+
 	return stmt, nil
 }
 
@@ -1456,6 +1482,58 @@ func (p *Parser) parseCreateDatabaseStatement() (*CreateDatabaseStatement, error
 		return nil, err
 	}
 	stmt.Name = lit
+
+	// Look for "WITH"
+	if tok, _, _ := p.scanIgnoreWhitespace(); tok == WITH {
+		// validate that at least one of DURATION, REPLICATION or NAME is provided
+		tok, pos, lit := p.scanIgnoreWhitespace()
+		if tok != DURATION && tok != REPLICATION && tok != NAME {
+			return nil, newParseError(tokstr(tok, lit), []string{"DURATION", "REPLICATION", "NAME"}, pos)
+		}
+		// rewind
+		p.unscan()
+
+		// mark statement as having a RetentionPolicyInfo defined
+		stmt.RetentionPolicyCreate = true
+
+		// Look for "DURATION"
+		var rpDuration time.Duration // default is forever
+		if err := p.parseTokens([]Token{DURATION}); err != nil {
+			p.unscan()
+		} else {
+			rpDuration, err = p.parseDuration()
+			if err != nil {
+				return nil, err
+			}
+		}
+		stmt.RetentionPolicyDuration = rpDuration
+
+		// Look for "REPLICATION"
+		var rpReplication = 1 // default is 1
+		if err := p.parseTokens([]Token{REPLICATION}); err != nil {
+			p.unscan()
+		} else {
+			rpReplication, err = p.parseInt(1, math.MaxInt32)
+			if err != nil {
+				return nil, err
+			}
+		}
+		stmt.RetentionPolicyReplication = rpReplication
+
+		// Look for "NAME"
+		var rpName string = "default" // default is default
+		if err := p.parseTokens([]Token{NAME}); err != nil {
+			p.unscan()
+		} else {
+			rpName, err = p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+		}
+		stmt.RetentionPolicyName = rpName
+	} else {
+		p.unscan()
+	}
 
 	return stmt, nil
 }
@@ -2253,7 +2331,7 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 		return &NumberLiteral{Val: v}, nil
 	case TRUE, FALSE:
 		return &BooleanLiteral{Val: (tok == TRUE)}, nil
-	case DURATION_VAL:
+	case DURATIONVAL:
 		v, _ := ParseDuration(lit)
 		return &DurationLiteral{Val: v}, nil
 	case MUL:
@@ -2337,6 +2415,47 @@ func (p *Parser) parseCall(name string) (*Call, error) {
 	return &Call{Name: name, Args: args}, nil
 }
 
+// parseResample parses a RESAMPLE [EVERY <duration>] [FOR <duration>].
+// This function assumes RESAMPLE has already been consumed.
+// EVERY and FOR are optional, but at least one of the two has to be used.
+func (p *Parser) parseResample() (time.Duration, time.Duration, error) {
+	var interval time.Duration
+	if p.parseTokenMaybe(EVERY) {
+		tok, pos, lit := p.scanIgnoreWhitespace()
+		if tok != DURATIONVAL {
+			return 0, 0, newParseError(tokstr(tok, lit), []string{"duration"}, pos)
+		}
+
+		d, err := ParseDuration(lit)
+		if err != nil {
+			return 0, 0, &ParseError{Message: err.Error(), Pos: pos}
+		}
+		interval = d
+	}
+
+	var maxDuration time.Duration
+	if p.parseTokenMaybe(FOR) {
+		tok, pos, lit := p.scanIgnoreWhitespace()
+		if tok != DURATIONVAL {
+			return 0, 0, newParseError(tokstr(tok, lit), []string{"duration"}, pos)
+		}
+
+		d, err := ParseDuration(lit)
+		if err != nil {
+			return 0, 0, &ParseError{Message: err.Error(), Pos: pos}
+		}
+		maxDuration = d
+	}
+
+	// Neither EVERY or FOR were read, so read the next token again
+	// so we can return a suitable error message.
+	if interval == 0 && maxDuration == 0 {
+		tok, pos, lit := p.scanIgnoreWhitespace()
+		return 0, 0, newParseError(tokstr(tok, lit), []string{"EVERY", "FOR"}, pos)
+	}
+	return interval, maxDuration, nil
+}
+
 // scan returns the next token from the underlying scanner.
 func (p *Parser) scan() (tok Token, pos Pos, lit string) { return p.s.Scan() }
 
@@ -2361,16 +2480,8 @@ func (p *Parser) unscan() { p.s.Unscan() }
 
 // ParseDuration parses a time duration from a string.
 func ParseDuration(s string) (time.Duration, error) {
-	// Return an error if the string is blank.
-	if len(s) == 0 {
-		return 0, ErrInvalidDuration
-	}
-
-	// If there's only character then it must be a digit (in microseconds).
-	if len(s) == 1 {
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return time.Duration(n) * time.Microsecond, nil
-		}
+	// Return an error if the string is blank or one character
+	if len(s) < 2 {
 		return 0, ErrInvalidDuration
 	}
 
@@ -2378,13 +2489,10 @@ func ParseDuration(s string) (time.Duration, error) {
 	a := split(s)
 
 	// Extract the unit of measure.
-	// If the last character is a digit then parse the whole string as microseconds.
-	// If the last two characters are "ms" the parse as milliseconds.
+	// If the last two characters are "ms" then parse as milliseconds.
 	// Otherwise just use the last character as the unit of measure.
 	var num, uom string
-	if isDigit(rune(a[len(a)-1])) {
-		num, uom = s, "u"
-	} else if len(s) > 2 && s[len(s)-2:] == "ms" {
+	if len(s) > 2 && s[len(s)-2:] == "ms" {
 		num, uom = string(a[:len(a)-2]), "ms"
 	} else {
 		num, uom = string(a[:len(a)-1]), string(a[len(a)-1:])
@@ -2434,7 +2542,10 @@ func FormatDuration(d time.Duration) string {
 	} else if d%time.Millisecond == 0 {
 		return fmt.Sprintf("%dms", d/time.Millisecond)
 	}
-	return fmt.Sprintf("%d", d/time.Microsecond)
+	// Although we accept both "u" and "µ" when reading microsecond durations,
+	// we output with "u", which can be represented in 1 byte,
+	// instead of "µ", which requires 2 bytes.
+	return fmt.Sprintf("%du", d/time.Microsecond)
 }
 
 // parseTokens consumes an expected sequence of tokens.
@@ -2445,6 +2556,17 @@ func (p *Parser) parseTokens(toks []Token) error {
 		}
 	}
 	return nil
+}
+
+// parseTokenMaybe consumes the next token if it matches the expected one and
+// does nothing if the next token is not the next one.
+func (p *Parser) parseTokenMaybe(expected Token) bool {
+	tok, _, _ := p.scanIgnoreWhitespace()
+	if tok != expected {
+		p.unscan()
+		return false
+	}
+	return true
 }
 
 // QuoteString returns a quoted string.

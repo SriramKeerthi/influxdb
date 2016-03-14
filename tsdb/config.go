@@ -3,16 +3,14 @@ package tsdb
 import (
 	"errors"
 	"fmt"
-	"log"
-	"os"
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
 	// DefaultEngine is the default engine for new shards
-	DefaultEngine = "bz1"
+	DefaultEngine = "tsm1"
 
 	// DefaultMaxWALSize is the default size of the WAL before it is flushed.
 	DefaultMaxWALSize = 100 * 1024 * 1024 // 100MB
@@ -39,7 +37,7 @@ const (
 	// for writes that a full flush and compaction are forced
 	DefaultFlushColdInterval = 5 * time.Second
 
-	// DefaultParititionSizeThreshold specifies when a partition gets to this size in
+	// DefaultPartitionSizeThreshold specifies when a partition gets to this size in
 	// memory, we should slow down writes until it gets a chance to compact.
 	// This will force clients to get backpressure if they're writing too fast. We need
 	// this because the WAL can take writes much faster than the index. So eventually
@@ -48,18 +46,35 @@ const (
 	// size for the in-memory WAL cache.
 	DefaultPartitionSizeThreshold = 50 * 1024 * 1024 // 50MB
 
-	// Default WAL settings for the TSM1 WAL
-	DefaultFlushMemorySizeThreshold    = 5 * 1024 * 1024   // 5MB
-	DefaultMaxMemorySizeThreshold      = 100 * 1024 * 1024 // 100MB
-	DefaultIndexCompactionAge          = time.Minute
-	DefaultIndexMinCompactionInterval  = time.Minute
-	DefaultIndexMinCompactionFileCount = 5
-	DefaultIndexCompactionFullAge      = 5 * time.Minute
+	// Default settings for TSM
+
+	// DefaultCacheMaxMemorySize is the maximum size a shard's cache can
+	// reach before it starts rejecting writes.
+	DefaultCacheMaxMemorySize = 500 * 1024 * 1024 // 500MB
+
+	// DefaultCacheSnapshotMemorySize is the size at which the engine will
+	// snapshot the cache and write it to a TSM file, freeing up memory
+	DefaultCacheSnapshotMemorySize = 25 * 1024 * 1024 // 25MB
+
+	// DefaultCacheSnapshotWriteColdDuration is the length of time at which
+	// the engine will snapshot the cache and write it to a new TSM file if
+	// the shard hasn't received writes or deletes
+	DefaultCacheSnapshotWriteColdDuration = time.Duration(time.Hour)
+
+	// DefaultCompactFullWriteColdDuration is the duration at which the engine
+	// will compact all TSM files in a shard if it hasn't received a write or delete
+	DefaultCompactFullWriteColdDuration = time.Duration(24 * time.Hour)
+
+	// DefaultMaxPointsPerBlock is the maximum number of points in an encoded
+	// block in a TSM file
+	DefaultMaxPointsPerBlock = 1000
 )
 
+// Config holds the configuration for the tsbd package.
 type Config struct {
-	Dir    string `toml:"dir"`
-	Engine string `toml:"engine"`
+	Enabled bool   `toml:"enabled"`
+	Dir     string `toml:"dir"`
+	Engine  string `toml:"engine"`
 
 	// WAL config options for b1 (introduced in 0.9.2)
 	MaxWALSize             int           `toml:"max-wal-size"`
@@ -75,62 +90,47 @@ type Config struct {
 	WALFlushColdInterval      toml.Duration `toml:"wal-flush-cold-interval"`
 	WALPartitionSizeThreshold uint64        `toml:"wal-partition-size-threshold"`
 
-	// WAL configuration options for tsm1 introduced in 0.9.5
-	WALFlushMemorySizeThreshold int `toml:"wal-flush-memory-size-threshold"`
-	WALMaxMemorySizeThreshold   int `toml:"wal-max-memory-size-threshold"`
-
-	// compaction options for tsm1 introduced in 0.9.5
-
-	// IndexCompactionAge specifies the duration after the data file creation time
-	// at which it is eligible to be compacted
-	IndexCompactionAge time.Duration `toml:"index-compaction-age"`
-
-	// IndexMinimumCompactionInterval specifies the minimum amount of time that must
-	// pass after a compaction before another compaction is run
-	IndexMinCompactionInterval time.Duration `toml:"index-min-compaction-interval"`
-
-	// IndexCompactionFileCount specifies the minimum number of data files that
-	// must be eligible for compaction before actually running one
-	IndexMinCompactionFileCount int `toml:"index-compaction-min-file-count"`
-
-	// IndexCompactionFullAge specifies how long after the last write was received
-	// in the WAL that a full compaction should be performed.
-	IndexCompactionFullAge time.Duration `toml:"index-compaction-full-age"`
-
 	// Query logging
 	QueryLogEnabled bool `toml:"query-log-enabled"`
+
+	// Compaction options for tsm1 (descriptions above with defaults)
+	CacheMaxMemorySize             uint64        `toml:"cache-max-memory-size"`
+	CacheSnapshotMemorySize        uint64        `toml:"cache-snapshot-memory-size"`
+	CacheSnapshotWriteColdDuration toml.Duration `toml:"cache-snapshot-write-cold-duration"`
+	CompactFullWriteColdDuration   toml.Duration `toml:"compact-full-write-cold-duration"`
+	MaxPointsPerBlock              int           `toml:"max-points-per-block"`
+
+	DataLoggingEnabled bool `toml:"data-logging-enabled"`
 }
 
+// NewConfig returns the default configuration for tsdb.
 func NewConfig() Config {
-	defaultEngine := DefaultEngine
-	if engine := os.Getenv("INFLUXDB_DATA_ENGINE"); engine != "" {
-		log.Println("TSDB engine selected via environment variable:", engine)
-		defaultEngine = engine
-	}
-
 	return Config{
-		Engine:                 defaultEngine,
+		Engine:                 DefaultEngine,
+		Enabled:                true, // data node enabled by default
 		MaxWALSize:             DefaultMaxWALSize,
 		WALFlushInterval:       toml.Duration(DefaultWALFlushInterval),
 		WALPartitionFlushDelay: toml.Duration(DefaultWALPartitionFlushDelay),
 
-		WALLoggingEnabled:           true,
-		WALReadySeriesSize:          DefaultReadySeriesSize,
-		WALCompactionThreshold:      DefaultCompactionThreshold,
-		WALMaxSeriesSize:            DefaultMaxSeriesSize,
-		WALFlushColdInterval:        toml.Duration(DefaultFlushColdInterval),
-		WALPartitionSizeThreshold:   DefaultPartitionSizeThreshold,
-		WALFlushMemorySizeThreshold: DefaultFlushMemorySizeThreshold,
-		WALMaxMemorySizeThreshold:   DefaultMaxMemorySizeThreshold,
-		IndexCompactionAge:          DefaultIndexCompactionAge,
-		IndexMinCompactionFileCount: DefaultIndexMinCompactionFileCount,
-		IndexCompactionFullAge:      DefaultIndexCompactionFullAge,
-		IndexMinCompactionInterval:  DefaultIndexMinCompactionInterval,
+		WALLoggingEnabled:         true,
+		WALReadySeriesSize:        DefaultReadySeriesSize,
+		WALCompactionThreshold:    DefaultCompactionThreshold,
+		WALMaxSeriesSize:          DefaultMaxSeriesSize,
+		WALFlushColdInterval:      toml.Duration(DefaultFlushColdInterval),
+		WALPartitionSizeThreshold: DefaultPartitionSizeThreshold,
 
 		QueryLogEnabled: true,
+
+		CacheMaxMemorySize:             DefaultCacheMaxMemorySize,
+		CacheSnapshotMemorySize:        DefaultCacheSnapshotMemorySize,
+		CacheSnapshotWriteColdDuration: toml.Duration(DefaultCacheSnapshotWriteColdDuration),
+		CompactFullWriteColdDuration:   toml.Duration(DefaultCompactFullWriteColdDuration),
+
+		DataLoggingEnabled: true,
 	}
 }
 
+// Validate validates the configuration hold by c.
 func (c *Config) Validate() error {
 	if c.Dir == "" {
 		return errors.New("Data.Dir must be specified")

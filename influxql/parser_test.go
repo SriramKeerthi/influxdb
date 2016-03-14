@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/influxql"
+	"github.com/influxdata/influxdb/influxql"
 )
 
 // Ensure the parser can parse a multi-statement query.
@@ -187,28 +187,6 @@ func TestParser_ParseStatement(t *testing.T) {
 					LHS: &influxql.VarRef{Val: "time"},
 					RHS: &influxql.TimeLiteral{Val: now.UTC()},
 				},
-			},
-		},
-
-		{
-			s: `SELECT derivative(mean(field1), 1h) FROM myseries;`,
-			stmt: &influxql.SelectStatement{
-				IsRawQuery: false,
-				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "derivative", Args: []influxql.Expr{&influxql.Call{Name: "mean", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}, &influxql.DurationLiteral{Val: time.Hour}}}},
-				},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
-			},
-		},
-
-		{
-			s: `SELECT derivative(mean(field1)) FROM myseries;`,
-			stmt: &influxql.SelectStatement{
-				IsRawQuery: false,
-				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "derivative", Args: []influxql.Expr{&influxql.Call{Name: "mean", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}}}},
-				},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
 			},
 		},
 
@@ -644,18 +622,20 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		// See issues https://github.com/influxdata/influxdb/issues/1647
+		// and https://github.com/influxdata/influxdb/issues/4404
 		// DELETE statement
-		{
-			s: `DELETE FROM myseries WHERE host = 'hosta.influxdb.org'`,
-			stmt: &influxql.DeleteStatement{
-				Source: &influxql.Measurement{Name: "myseries"},
-				Condition: &influxql.BinaryExpr{
-					Op:  influxql.EQ,
-					LHS: &influxql.VarRef{Val: "host"},
-					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
-				},
-			},
-		},
+		//{
+		//	s: `DELETE FROM myseries WHERE host = 'hosta.influxdb.org'`,
+		//	stmt: &influxql.DeleteStatement{
+		//		Source: &influxql.Measurement{Name: "myseries"},
+		//		Condition: &influxql.BinaryExpr{
+		//			Op:  influxql.EQ,
+		//			LHS: &influxql.VarRef{Val: "host"},
+		//			RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+		//		},
+		//	},
+		//},
 
 		// SHOW SERVERS
 		{
@@ -1033,12 +1013,12 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// DROP SERVER statement
 		{
-			s:    `DROP SERVER 123`,
-			stmt: &influxql.DropServerStatement{NodeID: 123},
+			s:    `DROP META SERVER 123`,
+			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: true},
 		},
 		{
-			s:    `DROP SERVER 123 FORCE`,
-			stmt: &influxql.DropServerStatement{NodeID: 123, Force: true},
+			s:    `DROP DATA SERVER 123`,
+			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: false},
 		},
 
 		// SHOW CONTINUOUS QUERIES statement
@@ -1049,7 +1029,7 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// CREATE CONTINUOUS QUERY ... INTO <measurement>
 		{
-			s: `CREATE CONTINUOUS QUERY myquery ON testdb BEGIN SELECT count(field1) INTO measure1 FROM myseries GROUP BY time(5m) END`,
+			s: `CREATE CONTINUOUS QUERY myquery ON testdb RESAMPLE EVERY 1m FOR 1h BEGIN SELECT count(field1) INTO measure1 FROM myseries GROUP BY time(5m) END`,
 			stmt: &influxql.CreateContinuousQueryStatement{
 				Name:     "myquery",
 				Database: "testdb",
@@ -1068,6 +1048,56 @@ func TestParser_ParseStatement(t *testing.T) {
 						},
 					},
 				},
+				ResampleEvery: time.Minute,
+				ResampleFor:   time.Hour,
+			},
+		},
+
+		{
+			s: `CREATE CONTINUOUS QUERY myquery ON testdb RESAMPLE FOR 1h BEGIN SELECT count(field1) INTO measure1 FROM myseries GROUP BY time(5m) END`,
+			stmt: &influxql.CreateContinuousQueryStatement{
+				Name:     "myquery",
+				Database: "testdb",
+				Source: &influxql.SelectStatement{
+					Fields:  []*influxql.Field{{Expr: &influxql.Call{Name: "count", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}}},
+					Target:  &influxql.Target{Measurement: &influxql.Measurement{Name: "measure1", IsTarget: true}},
+					Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+					Dimensions: []*influxql.Dimension{
+						{
+							Expr: &influxql.Call{
+								Name: "time",
+								Args: []influxql.Expr{
+									&influxql.DurationLiteral{Val: 5 * time.Minute},
+								},
+							},
+						},
+					},
+				},
+				ResampleFor: time.Hour,
+			},
+		},
+
+		{
+			s: `CREATE CONTINUOUS QUERY myquery ON testdb RESAMPLE EVERY 1m BEGIN SELECT count(field1) INTO measure1 FROM myseries GROUP BY time(5m) END`,
+			stmt: &influxql.CreateContinuousQueryStatement{
+				Name:     "myquery",
+				Database: "testdb",
+				Source: &influxql.SelectStatement{
+					Fields:  []*influxql.Field{{Expr: &influxql.Call{Name: "count", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}}},
+					Target:  &influxql.Target{Measurement: &influxql.Measurement{Name: "measure1", IsTarget: true}},
+					Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+					Dimensions: []*influxql.Dimension{
+						{
+							Expr: &influxql.Call{
+								Name: "time",
+								Args: []influxql.Expr{
+									&influxql.DurationLiteral{Val: 5 * time.Minute},
+								},
+							},
+						},
+					},
+				},
+				ResampleEvery: time.Minute,
 			},
 		},
 
@@ -1176,15 +1206,105 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `CREATE DATABASE testdb`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:        "testdb",
-				IfNotExists: false,
+				Name:                  "testdb",
+				IfNotExists:           false,
+				RetentionPolicyCreate: false,
 			},
 		},
 		{
 			s: `CREATE DATABASE IF NOT EXISTS testdb`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:        "testdb",
-				IfNotExists: true,
+				Name:                  "testdb",
+				IfNotExists:           true,
+				RetentionPolicyCreate: false,
+			},
+		},
+		{
+			s: `CREATE DATABASE testdb WITH DURATION 24h`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                false,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    24 * time.Hour,
+				RetentionPolicyReplication: 1,
+				RetentionPolicyName:        "default",
+			},
+		},
+		{
+			s: `CREATE DATABASE IF NOT EXISTS testdb WITH DURATION 24h`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                true,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    24 * time.Hour,
+				RetentionPolicyReplication: 1,
+				RetentionPolicyName:        "default",
+			},
+		},
+		{
+			s: `CREATE DATABASE testdb WITH REPLICATION 2`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                false,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    0,
+				RetentionPolicyReplication: 2,
+				RetentionPolicyName:        "default",
+			},
+		},
+		{
+			s: `CREATE DATABASE IF NOT EXISTS testdb WITH REPLICATION 2`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                true,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    0,
+				RetentionPolicyReplication: 2,
+				RetentionPolicyName:        "default",
+			},
+		},
+		{
+			s: `CREATE DATABASE testdb WITH NAME test_name`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                false,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    0,
+				RetentionPolicyReplication: 1,
+				RetentionPolicyName:        "test_name",
+			},
+		},
+		{
+			s: `CREATE DATABASE IF NOT EXISTS testdb WITH NAME test_name`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                true,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    0,
+				RetentionPolicyReplication: 1,
+				RetentionPolicyName:        "test_name",
+			},
+		},
+		{
+			s: `CREATE DATABASE testdb WITH DURATION 24h REPLICATION 2 NAME test_name`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                false,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    24 * time.Hour,
+				RetentionPolicyReplication: 2,
+				RetentionPolicyName:        "test_name",
+			},
+		},
+		{
+			s: `CREATE DATABASE IF NOT EXISTS testdb WITH DURATION 24h REPLICATION 2 NAME test_name`,
+			stmt: &influxql.CreateDatabaseStatement{
+				Name:                       "testdb",
+				IfNotExists:                true,
+				RetentionPolicyCreate:      true,
+				RetentionPolicyDuration:    24 * time.Hour,
+				RetentionPolicyReplication: 2,
+				RetentionPolicyName:        "test_name",
 			},
 		},
 
@@ -1528,12 +1648,14 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT top(field1,host,'server',foo) FROM myseries`, err: `expected integer as last argument in top(), found foo`},
 		{s: `SELECT top(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in top(), found 5.000`},
 		{s: `SELECT top(field1,max(foo),'server',2) FROM myseries`, err: `only fields or tags are allowed in top(), found max(foo)`},
+		{s: `SELECT top(value, 10) + count(value) FROM myseries`, err: `cannot use top() inside of a binary expression`},
 		{s: `SELECT bottom() FROM myseries`, err: `invalid number of arguments for bottom, expected at least 2, got 0`},
 		{s: `SELECT bottom(field1) FROM myseries`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
 		{s: `SELECT bottom(field1,foo) FROM myseries`, err: `expected integer as last argument in bottom(), found foo`},
 		{s: `SELECT bottom(field1,host,'server',foo) FROM myseries`, err: `expected integer as last argument in bottom(), found foo`},
 		{s: `SELECT bottom(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in bottom(), found 5.000`},
 		{s: `SELECT bottom(field1,max(foo),'server',2) FROM myseries`, err: `only fields or tags are allowed in bottom(), found max(foo)`},
+		{s: `SELECT bottom(value, 10) + count(value) FROM myseries`, err: `cannot use bottom() inside of a binary expression`},
 		{s: `SELECT percentile() FROM myseries`, err: `invalid number of arguments for percentile, expected 2, got 0`},
 		{s: `SELECT percentile(field1) FROM myseries`, err: `invalid number of arguments for percentile, expected 2, got 1`},
 		{s: `SELECT percentile(field1, foo) FROM myseries`, err: `expected float argument in percentile()`},
@@ -1573,24 +1695,41 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `select derivative() from myseries`, err: `invalid number of arguments for derivative, expected at least 1 but no more than 2, got 0`},
 		{s: `select derivative(mean(value), 1h, 3) from myseries`, err: `invalid number of arguments for derivative, expected at least 1 but no more than 2, got 3`},
 		{s: `SELECT derivative(value) FROM myseries group by time(1h)`, err: `aggregate function required inside the call to derivative`},
+		{s: `SELECT derivative(top(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
+		{s: `SELECT derivative(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
+		{s: `SELECT derivative(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT derivative(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT derivative(mean(value), 1h) FROM myseries where time < now() and time > now() - 1d`, err: `derivative aggregate requires a GROUP BY interval`},
 		{s: `SELECT non_negative_derivative(), field1 FROM myseries`, err: `mixing aggregate and non-aggregate queries is not supported`},
 		{s: `select non_negative_derivative() from myseries`, err: `invalid number of arguments for non_negative_derivative, expected at least 1 but no more than 2, got 0`},
 		{s: `select non_negative_derivative(mean(value), 1h, 3) from myseries`, err: `invalid number of arguments for non_negative_derivative, expected at least 1 but no more than 2, got 3`},
 		{s: `SELECT non_negative_derivative(value) FROM myseries group by time(1h)`, err: `aggregate function required inside the call to non_negative_derivative`},
+		{s: `SELECT non_negative_derivative(top(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
+		{s: `SELECT non_negative_derivative(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
+		{s: `SELECT non_negative_derivative(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT non_negative_derivative(mean(value), 1h) FROM myseries where time < now() and time > now() - 1d`, err: `non_negative_derivative aggregate requires a GROUP BY interval`},
+		{s: `SELECT non_negative_derivative(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
 		{s: `SELECT field1 from myseries WHERE host =~ 'asd' LIMIT 1`, err: `found asd, expected regex at line 1, char 42`},
 		{s: `SELECT value > 2 FROM cpu`, err: `invalid operator > in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
 		{s: `SELECT value = 2 FROM cpu`, err: `invalid operator = in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
 		{s: `SELECT s =~ /foo/ FROM cpu`, err: `invalid operator =~ in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
-		{s: `DELETE`, err: `found EOF, expected FROM at line 1, char 8`},
-		{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
-		{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
+		// TODO: Remove this restriction in the future: https://github.com/influxdata/influxdb/issues/5968
+		{s: `SELECT mean(cpu_total - cpu_idle) FROM cpu`, err: `expected field argument in mean()`},
+		{s: `SELECT derivative(mean(cpu_total - cpu_idle), 1s) FROM cpu WHERE time < now() AND time > now() - 1d GROUP BY time(1h)`, err: `expected field argument in mean()`},
+		// See issues https://github.com/influxdata/influxdb/issues/1647
+		// and https://github.com/influxdata/influxdb/issues/4404
+		//{s: `DELETE`, err: `found EOF, expected FROM at line 1, char 8`},
+		//{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
+		//{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
+		{s: `DELETE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
+		{s: `DELETE FROM`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
+		{s: `DELETE FROM myseries WHERE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
 		{s: `DROP MEASUREMENT`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES`, err: `found EOF, expected FROM, WHERE at line 1, char 13`},
 		{s: `DROP SERIES FROM`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES FROM src WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
-		{s: `DROP SERVER`, err: `found EOF, expected number at line 1, char 13`},
-		{s: `DROP SERVER abc`, err: `found abc, expected number at line 1, char 13`},
-		{s: `DROP SERVER 1 1`, err: `found 1, expected FORCE at line 1, char 15`},
+		{s: `DROP META SERVER`, err: `found EOF, expected number at line 1, char 18`},
+		{s: `DROP DATA SERVER abc`, err: `found abc, expected number at line 1, char 18`},
 		{s: `SHOW CONTINUOUS`, err: `found EOF, expected QUERIES at line 1, char 17`},
 		{s: `SHOW RETENTION`, err: `found EOF, expected POLICIES at line 1, char 16`},
 		{s: `SHOW RETENTION ON`, err: `found ON, expected POLICIES at line 1, char 16`},
@@ -1609,12 +1748,22 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `DROP CONTINUOUS QUERY myquery ON`, err: `found EOF, expected identifier at line 1, char 34`},
 		{s: `CREATE CONTINUOUS`, err: `found EOF, expected QUERY at line 1, char 19`},
 		{s: `CREATE CONTINUOUS QUERY`, err: `found EOF, expected identifier at line 1, char 25`},
+		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(10s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
+		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE EVERY 10s FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(5s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
 		{s: `DROP FOO`, err: `found FOO, expected SERIES, CONTINUOUS, MEASUREMENT, SERVER, SUBSCRIPTION at line 1, char 6`},
 		{s: `CREATE FOO`, err: `found FOO, expected CONTINUOUS, DATABASE, USER, RETENTION, SUBSCRIPTION at line 1, char 8`},
 		{s: `CREATE DATABASE`, err: `found EOF, expected identifier at line 1, char 17`},
+		{s: `CREATE DATABASE "testdb" WITH`, err: `found EOF, expected DURATION, REPLICATION, NAME at line 1, char 31`},
+		{s: `CREATE DATABASE "testdb" WITH DURATION`, err: `found EOF, expected duration at line 1, char 40`},
+		{s: `CREATE DATABASE "testdb" WITH REPLICATION`, err: `found EOF, expected number at line 1, char 43`},
+		{s: `CREATE DATABASE "testdb" WITH NAME`, err: `found EOF, expected identifier at line 1, char 36`},
 		{s: `CREATE DATABASE IF`, err: `found EOF, expected NOT at line 1, char 20`},
 		{s: `CREATE DATABASE IF NOT`, err: `found EOF, expected EXISTS at line 1, char 24`},
 		{s: `CREATE DATABASE IF NOT EXISTS`, err: `found EOF, expected identifier at line 1, char 31`},
+		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH`, err: `found EOF, expected DURATION, REPLICATION, NAME at line 1, char 45`},
+		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH DURATION`, err: `found EOF, expected duration at line 1, char 54`},
+		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH REPLICATION`, err: `found EOF, expected number at line 1, char 57`},
+		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH NAME`, err: `found EOF, expected identifier at line 1, char 50`},
 		{s: `DROP DATABASE`, err: `found EOF, expected identifier at line 1, char 15`},
 		{s: `DROP DATABASE IF`, err: `found EOF, expected EXISTS at line 1, char 18`},
 		{s: `DROP DATABASE IF EXISTS`, err: `found EOF, expected identifier at line 1, char 25`},
@@ -1734,7 +1883,6 @@ func TestParser_ParseStatement(t *testing.T) {
 
 	for i, tt := range tests {
 		if tt.skip {
-			t.Logf("skipping test of '%s'", tt.s)
 			continue
 		}
 		stmt, err := influxql.NewParser(strings.NewReader(tt.s)).ParseStatement()
@@ -1959,8 +2107,6 @@ func TestParseDuration(t *testing.T) {
 		d   time.Duration
 		err string
 	}{
-		{s: `3`, d: 3 * time.Microsecond},
-		{s: `1000`, d: 1000 * time.Microsecond},
 		{s: `10u`, d: 10 * time.Microsecond},
 		{s: `10µ`, d: 10 * time.Microsecond},
 		{s: `15ms`, d: 15 * time.Millisecond},
@@ -1971,7 +2117,10 @@ func TestParseDuration(t *testing.T) {
 		{s: `2w`, d: 2 * 7 * 24 * time.Hour},
 
 		{s: ``, err: "invalid duration"},
+		{s: `3`, err: "invalid duration"},
+		{s: `1000`, err: "invalid duration"},
 		{s: `w`, err: "invalid duration"},
+		{s: `ms`, err: "invalid duration"},
 		{s: `1.2w`, err: "invalid duration"},
 		{s: `10x`, err: "invalid duration"},
 	}
@@ -1992,8 +2141,8 @@ func TestFormatDuration(t *testing.T) {
 		d time.Duration
 		s string
 	}{
-		{d: 3 * time.Microsecond, s: `3`},
-		{d: 1001 * time.Microsecond, s: `1001`},
+		{d: 3 * time.Microsecond, s: `3u`},
+		{d: 1001 * time.Microsecond, s: `1001u`},
 		{d: 15 * time.Millisecond, s: `15ms`},
 		{d: 100 * time.Second, s: `100s`},
 		{d: 2 * time.Minute, s: `2m`},
@@ -2104,7 +2253,7 @@ func TestDropSeriesStatement_String(t *testing.T) {
 
 func BenchmarkParserParseStatement(b *testing.B) {
 	b.ReportAllocs()
-	s := `SELECT field FROM "series" WHERE value > 10`
+	s := `SELECT "field" FROM "series" WHERE value > 10`
 	for i := 0; i < b.N; i++ {
 		if stmt, err := influxql.NewParser(strings.NewReader(s)).ParseStatement(); err != nil {
 			b.Fatalf("unexpected error: %s", err)
@@ -2118,14 +2267,18 @@ func BenchmarkParserParseStatement(b *testing.B) {
 // MustParseSelectStatement parses a select statement. Panic on error.
 func MustParseSelectStatement(s string) *influxql.SelectStatement {
 	stmt, err := influxql.NewParser(strings.NewReader(s)).ParseStatement()
-	panicIfErr(err)
+	if err != nil {
+		panic(err)
+	}
 	return stmt.(*influxql.SelectStatement)
 }
 
 // MustParseExpr parses an expression. Panic on error.
 func MustParseExpr(s string) influxql.Expr {
 	expr, err := influxql.NewParser(strings.NewReader(s)).ParseExpr()
-	panicIfErr(err)
+	if err != nil {
+		panic(err)
+	}
 	return expr
 }
 
@@ -2159,18 +2312,16 @@ func newAlterRetentionPolicyStatement(name string, DB string, d time.Duration, r
 // mustMarshalJSON encodes a value to JSON.
 func mustMarshalJSON(v interface{}) []byte {
 	b, err := json.Marshal(v)
-	panicIfErr(err)
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
 
 func mustParseDuration(s string) time.Duration {
 	d, err := influxql.ParseDuration(s)
-	panicIfErr(err)
-	return d
-}
-
-func panicIfErr(err error) {
 	if err != nil {
 		panic(err)
 	}
+	return d
 }

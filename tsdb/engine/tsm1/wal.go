@@ -1,6 +1,9 @@
 package tsm1
 
 import (
+	"encoding/binary"
+	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +17,8 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 const (
@@ -27,9 +32,12 @@ const (
 
 	defaultBufLen = 1024 << 10 // 1MB (sized for batches of 5000 points)
 
+	// walEncodeBufSize is the size of the wal entry encoding buffer
+	walEncodeBufSize = 4 * 1024 * 1024
+
 	float64EntryType = 1
-	int64EntryType   = 2
-	boolEntryType    = 3
+	integerEntryType = 2
+	booleanEntryType = 3
 	stringEntryType  = 4
 )
 
@@ -39,42 +47,25 @@ type SegmentInfo struct {
 	id   int
 }
 
-type SegmentInfos []SegmentInfo
-
-func (sis SegmentInfos) Names() []string {
-	var names []string
-	for _, s := range sis {
-		names = append(names, s.name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func (sis SegmentInfos) IDs() []int {
-	var ids []int
-	for _, s := range sis {
-		id, err := idFromFileName(s.name)
-		if err != nil {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	return ids
-}
-
-// walEntry is a byte written to a wal segment file that indicates what the following compressed block contains
-type walEntryType byte
+// WalEntryType is a byte written to a wal segment file that indicates what the following compressed block contains
+type WalEntryType byte
 
 const (
-	WriteWALEntryType  walEntryType = 0x01
-	DeleteWALEntryType walEntryType = 0x02
+	WriteWALEntryType  WalEntryType = 0x01
+	DeleteWALEntryType WalEntryType = 0x02
 )
 
 var ErrWALClosed = fmt.Errorf("WAL closed")
 
+// Statistics gathered by the WAL.
+const (
+	statWALOldBytes     = "oldSegmentsDiskBytes"
+	statWALCurrentBytes = "currentSegmentDiskBytes"
+)
+
 type WAL struct {
-	mu sync.RWMutex
+	mu            sync.RWMutex
+	lastWriteTime time.Time
 
 	path string
 
@@ -94,17 +85,26 @@ type WAL struct {
 
 	// LoggingEnabled specifies if detailed logs should be output
 	LoggingEnabled bool
+
+	statMap *expvar.Map
 }
 
 func NewWAL(path string) *WAL {
+	db, rp := tsdb.DecodeStorePath(path)
 	return &WAL{
 		path: path,
 
 		// these options should be overriden by any options in the config
 		LogOutput:   os.Stderr,
 		SegmentSize: DefaultSegmentSize,
-		logger:      log.New(os.Stderr, "[tsm1devwal] ", log.LstdFlags),
+		logger:      log.New(os.Stderr, "[tsm1wal] ", log.LstdFlags),
 		closing:     make(chan struct{}),
+
+		statMap: influxdb.NewStatistics(
+			"tsm1_wal:"+path,
+			"tsm1_wal",
+			map[string]string{"path": path, "database": db, "retentionPolicy": rp},
+		),
 	}
 }
 
@@ -128,7 +128,49 @@ func (l *WAL) Open() error {
 		return err
 	}
 
+	segments, err := segmentFileNames(l.path)
+	if err != nil {
+		return err
+	}
+
+	if len(segments) > 0 {
+		lastSegment := segments[len(segments)-1]
+		id, err := idFromFileName(lastSegment)
+		if err != nil {
+			return err
+		}
+
+		l.currentSegmentID = id
+		stat, err := os.Stat(lastSegment)
+		if err != nil {
+			return err
+		}
+
+		if stat.Size() == 0 {
+			os.Remove(lastSegment)
+			segments = segments[:len(segments)-1]
+		}
+		if err := l.newSegmentFile(); err != nil {
+			return err
+		}
+	}
+
+	var totalOldDiskSize int64
+	for _, seg := range segments {
+		stat, err := os.Stat(seg)
+		if err != nil {
+			return err
+		}
+
+		totalOldDiskSize += stat.Size()
+	}
+	sizeStat := new(expvar.Int)
+	sizeStat.Set(totalOldDiskSize)
+	l.statMap.Set(statWALOldBytes, sizeStat)
+
 	l.closing = make(chan struct{})
+
+	l.lastWriteTime = time.Now()
 
 	return nil
 }
@@ -149,87 +191,152 @@ func (l *WAL) WritePoints(values map[string][]Value) (int, error) {
 	return id, nil
 }
 
-func (l *WAL) ClosedSegments() (SegmentInfos, error) {
+func (l *WAL) ClosedSegments() ([]string, error) {
 	l.mu.RLock()
-	var activePath string
-	if l.currentSegmentWriter != nil {
-		activePath = l.currentSegmentWriter.Path()
-	}
-
+	defer l.mu.RUnlock()
 	// Not loading files from disk so nothing to do
 	if l.path == "" {
-		l.mu.RUnlock()
 		return nil, nil
 	}
-	l.mu.RUnlock()
 
-	files, err := l.segmentFileNames()
+	var currentFile string
+	if l.currentSegmentWriter != nil {
+		currentFile = l.currentSegmentWriter.path()
+	}
+
+	files, err := segmentFileNames(l.path)
 	if err != nil {
 		return nil, err
 	}
 
-	var sis SegmentInfos
+	var closedFiles []string
 	for _, fn := range files {
-		// Skip the active segment
-		if fn == activePath {
+		// Skip the current path
+		if fn == currentFile {
 			continue
 		}
 
-		id, err := idFromFileName(fn)
-		if err != nil {
-			return nil, err
-		}
-		si := SegmentInfo{name: fn, id: id}
-		sis = append(sis, si)
+		closedFiles = append(closedFiles, fn)
 	}
-	return sis, nil
+
+	return closedFiles, nil
+}
+
+func (l *WAL) Remove(files []string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, fn := range files {
+		os.RemoveAll(fn)
+	}
+
+	// Refresh the on-disk size stats
+	segments, err := segmentFileNames(l.path)
+	if err != nil {
+		return err
+	}
+
+	var totalOldDiskSize int64
+	for _, seg := range segments {
+		stat, err := os.Stat(seg)
+		if err != nil {
+			return err
+		}
+
+		totalOldDiskSize += stat.Size()
+	}
+	sizeStat := new(expvar.Int)
+	sizeStat.Set(totalOldDiskSize)
+	l.statMap.Set(statWALOldBytes, sizeStat)
+
+	return nil
+}
+
+// LastWriteTime is the last time anything was written to the WAL
+func (l *WAL) LastWriteTime() time.Time {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.lastWriteTime
 }
 
 func (l *WAL) writeToLog(entry WALEntry) (int, error) {
-	l.mu.RLock()
+	// encode and compress the entry while we're not locked
+	bytes := getBuf(walEncodeBufSize)
+	defer putBuf(bytes)
+
+	b, err := entry.Encode(bytes)
+	if err != nil {
+		return -1, err
+	}
+
+	encBuf := getBuf(snappy.MaxEncodedLen(len(b)))
+	defer putBuf(encBuf)
+	compressed := snappy.Encode(encBuf, b)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	// Make sure the log has not been closed
 	select {
 	case <-l.closing:
-		l.mu.RUnlock()
 		return -1, ErrWALClosed
 	default:
 	}
-	l.mu.RUnlock()
 
+	// roll the segment file if needed
 	if err := l.rollSegment(); err != nil {
 		return -1, fmt.Errorf("error rolling WAL segment: %v", err)
 	}
 
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if err := l.currentSegmentWriter.Write(entry); err != nil {
+	// write and sync
+	if err := l.currentSegmentWriter.Write(entry.Type(), compressed); err != nil {
 		return -1, fmt.Errorf("error writing WAL entry: %v", err)
 	}
 
-	return l.currentSegmentID, l.currentSegmentWriter.Sync()
+	// Update stats for current segment size
+	curSize := new(expvar.Int)
+	curSize.Set(int64(l.currentSegmentWriter.size))
+	l.statMap.Set(statWALCurrentBytes, curSize)
+
+	l.lastWriteTime = time.Now()
+
+	return l.currentSegmentID, l.currentSegmentWriter.sync()
 }
 
+// rollSegment closes the current segment and opens a new one if the current segment is over
+// the max segment size.
 func (l *WAL) rollSegment() error {
-	l.mu.RLock()
-
-	if l.currentSegmentWriter == nil || l.currentSegmentWriter.Size() > DefaultSegmentSize {
-		l.mu.RUnlock()
-		l.mu.Lock()
-		defer l.mu.Unlock()
+	if l.currentSegmentWriter == nil || l.currentSegmentWriter.size > DefaultSegmentSize {
 		if err := l.newSegmentFile(); err != nil {
 			// A drop database or RP call could trigger this error if writes were in-flight
 			// when the drop statement executes.
-			return fmt.Errorf("error opening new segment file for wal: %v", err)
+			return fmt.Errorf("error opening new segment file for wal (2): %v", err)
 		}
 		return nil
 	}
-	l.mu.RUnlock()
+
+	return nil
+}
+
+// CloseSegment closes the current segment if it is non-empty and opens a new one.
+func (l *WAL) CloseSegment() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.currentSegmentWriter == nil || l.currentSegmentWriter.size > 0 {
+		if err := l.newSegmentFile(); err != nil {
+			// A drop database or RP call could trigger this error if writes were in-flight
+			// when the drop statement executes.
+			return fmt.Errorf("error opening new segment file for wal (1): %v", err)
+		}
+		return nil
+	}
 	return nil
 }
 
 // Delete deletes the given keys, returning the segment ID for the operation.
 func (l *WAL) Delete(keys []string) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
 	entry := &DeleteWALEntry{
 		Keys: keys,
 	}
@@ -250,15 +357,16 @@ func (l *WAL) Close() error {
 	close(l.closing)
 
 	if l.currentSegmentWriter != nil {
-		l.currentSegmentWriter.Close()
+		l.currentSegmentWriter.close()
+		l.currentSegmentWriter = nil
 	}
 
 	return nil
 }
 
 // segmentFileNames will return all files that are WAL segment files in sorted order by ascending ID
-func (l *WAL) segmentFileNames() ([]string, error) {
-	names, err := filepath.Glob(filepath.Join(l.path, fmt.Sprintf("%s*.%s", WALFilePrefix, WALFileExtension)))
+func segmentFileNames(dir string) ([]string, error) {
+	names, err := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%s*.%s", WALFilePrefix, WALFileExtension)))
 	if err != nil {
 		return nil, err
 	}
@@ -270,9 +378,10 @@ func (l *WAL) segmentFileNames() ([]string, error) {
 func (l *WAL) newSegmentFile() error {
 	l.currentSegmentID++
 	if l.currentSegmentWriter != nil {
-		if err := l.currentSegmentWriter.Close(); err != nil {
+		if err := l.currentSegmentWriter.close(); err != nil {
 			return err
 		}
+		l.statMap.Add(statWALOldBytes, int64(l.currentSegmentWriter.size))
 	}
 
 	fileName := filepath.Join(l.path, fmt.Sprintf("%s%05d.%s", WALFilePrefix, l.currentSegmentID, WALFileExtension))
@@ -282,13 +391,18 @@ func (l *WAL) newSegmentFile() error {
 	}
 	l.currentSegmentWriter = NewWALSegmentWriter(fd)
 
+	// Reset the current segment size stat
+	curSize := new(expvar.Int)
+	curSize.Set(0)
+	l.statMap.Set(statWALCurrentBytes, curSize)
+
 	return nil
 }
 
 // WALEntry is record stored in each WAL segment.  Each entry has a type
 // and an opaque, type dependent byte slice data attribute.
 type WALEntry interface {
-	Type() walEntryType
+	Type() WalEntryType
 	Encode(dst []byte) ([]byte, error)
 	MarshalBinary() ([]byte, error)
 	UnmarshalBinary(b []byte) error
@@ -309,7 +423,8 @@ func (w *WriteWALEntry) Encode(dst []byte) ([]byte, error) {
 	// slice is written.  Following the type, the length and key bytes are written.
 	// Following the key, a 4 byte count followed by each value as a 8 byte time
 	// and N byte value.  The value is dependent on the type being encoded.  float64,
-	// int64, use 8 bytes, bool uses 1 byte, and string is similar to the key encoding.
+	// int64, use 8 bytes, boolean uses 1 byte, and string is similar to the key encoding,
+	// except that string values have a 4-byte length, and keys only use 2 bytes.
 	//
 	// This structure is then repeated for each key an value slices.
 	//
@@ -317,54 +432,108 @@ func (w *WriteWALEntry) Encode(dst []byte) ([]byte, error) {
 	// │                           WriteWALEntry                            │
 	// ├──────┬─────────┬────────┬───────┬─────────┬─────────┬───┬──────┬───┤
 	// │ Type │ Key Len │   Key  │ Count │  Time   │  Value  │...│ Type │...│
-	// │1 byte│ 4 bytes │ N bytes│4 bytes│ 8 bytes │ N bytes │   │1 byte│   │
+	// │1 byte│ 2 bytes │ N bytes│4 bytes│ 8 bytes │ N bytes │   │1 byte│   │
 	// └──────┴─────────┴────────┴───────┴─────────┴─────────┴───┴──────┴───┘
+
+	encLen := 7 * len(w.Values) // Type (1), Key Length (2), and Count (4) for each key
+
+	// determine required length
+	for k, v := range w.Values {
+		encLen += len(k)
+		if len(v) == 0 {
+			return nil, errors.New("empty value slice in WAL entry")
+		}
+
+		encLen += 8 * len(v) // timestamps (8)
+
+		switch v[0].(type) {
+		case *FloatValue, *IntegerValue:
+			encLen += 8 * len(v)
+		case *BooleanValue:
+			encLen += 1 * len(v)
+		case *StringValue:
+			for _, vv := range v {
+				str, ok := vv.(*StringValue)
+				if !ok {
+					return nil, fmt.Errorf("non-string found in string value slice: %T", vv)
+				}
+				encLen += 4 + len(str.value)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported value type: %T", v[0])
+		}
+	}
+
+	// allocate or re-slice to correct size
+	if len(dst) < encLen {
+		dst = make([]byte, encLen)
+	} else {
+		dst = dst[:encLen]
+	}
+
+	// Finally, encode the entry
 	var n int
+	var curType byte
 
 	for k, v := range w.Values {
-
-		switch v[0].Value().(type) {
-		case float64:
-			dst[n] = float64EntryType
-		case int64:
-			dst[n] = int64EntryType
-		case bool:
-			dst[n] = boolEntryType
-		case string:
-			dst[n] = stringEntryType
+		switch v[0].(type) {
+		case *FloatValue:
+			curType = float64EntryType
+		case *IntegerValue:
+			curType = integerEntryType
+		case *BooleanValue:
+			curType = booleanEntryType
+		case *StringValue:
+			curType = stringEntryType
 		default:
-			return nil, fmt.Errorf("unsupported value type: %#v", v[0].Value())
+			return nil, fmt.Errorf("unsupported value type: %T", v[0])
 		}
+		dst[n] = curType
 		n++
 
-		// Make sure we have enough space in our buf before copying.  If not,
-		// grow the buf.
-		if len(k)+2+len(v)*8+4 > len(dst)-n {
-			grow := make([]byte, len(dst)*2)
-			dst = append(dst, grow...)
-		}
+		binary.BigEndian.PutUint16(dst[n:n+2], uint16(len(k)))
+		n += 2
+		n += copy(dst[n:], k)
 
-		n += copy(dst[n:], u16tob(uint16(len(k))))
-		n += copy(dst[n:], []byte(k))
-
-		n += copy(dst[n:], u32tob(uint32(len(v))))
+		binary.BigEndian.PutUint32(dst[n:n+4], uint32(len(v)))
+		n += 4
 
 		for _, vv := range v {
-			n += copy(dst[n:], u64tob(uint64(vv.Time().UnixNano())))
-			switch t := vv.Value().(type) {
-			case float64:
-				n += copy(dst[n:], u64tob(uint64(math.Float64bits(t))))
-			case int64:
-				n += copy(dst[n:], u64tob(uint64(t)))
-			case bool:
-				if t {
-					n += copy(dst[n:], []byte{1})
-				} else {
-					n += copy(dst[n:], []byte{0})
+			binary.BigEndian.PutUint64(dst[n:n+8], uint64(vv.UnixNano()))
+			n += 8
+
+			switch vv := vv.(type) {
+			case *FloatValue:
+				if curType != float64EntryType {
+					return nil, fmt.Errorf("incorrect value found in %T slice: %T", v[0].Value(), vv)
 				}
-			case string:
-				n += copy(dst[n:], u32tob(uint32(len(t))))
-				n += copy(dst[n:], []byte(t))
+				binary.BigEndian.PutUint64(dst[n:n+8], math.Float64bits(vv.value))
+				n += 8
+			case *IntegerValue:
+				if curType != integerEntryType {
+					return nil, fmt.Errorf("incorrect value found in %T slice: %T", v[0].Value(), vv)
+				}
+				binary.BigEndian.PutUint64(dst[n:n+8], uint64(vv.value))
+				n += 8
+			case *BooleanValue:
+				if curType != booleanEntryType {
+					return nil, fmt.Errorf("incorrect value found in %T slice: %T", v[0].Value(), vv)
+				}
+				if vv.value {
+					dst[n] = 1
+				} else {
+					dst[n] = 0
+				}
+				n++
+			case *StringValue:
+				if curType != stringEntryType {
+					return nil, fmt.Errorf("incorrect value found in %T slice: %T", v[0].Value(), vv)
+				}
+				binary.BigEndian.PutUint32(dst[n:n+4], uint32(len(vv.value)))
+				n += 4
+				n += copy(dst[n:], vv.value)
+			default:
+				return nil, fmt.Errorf("unsupported value found in %T slice: %T", v[0].Value(), vv)
 			}
 		}
 	}
@@ -384,22 +553,22 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 		typ := b[i]
 		i++
 
-		length := int(btou16(b[i : i+2]))
+		length := int(binary.BigEndian.Uint16(b[i : i+2]))
 		i += 2
 		k := string(b[i : i+length])
 		i += length
 
-		nvals := int(btou32(b[i : i+4]))
+		nvals := int(binary.BigEndian.Uint32(b[i : i+4]))
 		i += 4
 
 		var values []Value
 		switch typ {
 		case float64EntryType:
 			values = getFloat64Values(nvals)
-		case int64EntryType:
-			values = getInt64Values(nvals)
-		case boolEntryType:
-			values = getBoolValues(nvals)
+		case integerEntryType:
+			values = getIntegerValues(nvals)
+		case booleanEntryType:
+			values = getBooleanValues(nvals)
 		case stringEntryType:
 			values = getStringValues(nvals)
 		default:
@@ -407,29 +576,29 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 		}
 
 		for j := 0; j < nvals; j++ {
-			t := time.Unix(0, int64(btou64(b[i:i+8])))
+			un := int64(binary.BigEndian.Uint64(b[i : i+8]))
 			i += 8
 
 			switch typ {
 			case float64EntryType:
-				v := math.Float64frombits((btou64(b[i : i+8])))
+				v := math.Float64frombits((binary.BigEndian.Uint64(b[i : i+8])))
 				i += 8
 				if fv, ok := values[j].(*FloatValue); ok {
-					fv.time = t
+					fv.unixnano = un
 					fv.value = v
 				}
-			case int64EntryType:
-				v := int64(btou64(b[i : i+8]))
+			case integerEntryType:
+				v := int64(binary.BigEndian.Uint64(b[i : i+8]))
 				i += 8
-				if fv, ok := values[j].(*Int64Value); ok {
-					fv.time = t
+				if fv, ok := values[j].(*IntegerValue); ok {
+					fv.unixnano = un
 					fv.value = v
 				}
-			case boolEntryType:
+			case booleanEntryType:
 				v := b[i]
 				i += 1
-				if fv, ok := values[j].(*BoolValue); ok {
-					fv.time = t
+				if fv, ok := values[j].(*BooleanValue); ok {
+					fv.unixnano = un
 					if v == 1 {
 						fv.value = true
 					} else {
@@ -437,12 +606,16 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 					}
 				}
 			case stringEntryType:
-				length := int(btou32(b[i : i+4]))
+				length := int(binary.BigEndian.Uint32(b[i : i+4]))
+				if i+length > int(uint32(len(b))) {
+					return fmt.Errorf("corrupted write wall entry")
+				}
+
 				i += 4
 				v := string(b[i : i+length])
 				i += length
 				if fv, ok := values[j].(*StringValue); ok {
-					fv.time = t
+					fv.unixnano = un
 					fv.value = v
 				}
 			default:
@@ -454,7 +627,7 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 	return nil
 }
 
-func (w *WriteWALEntry) Type() walEntryType {
+func (w *WriteWALEntry) Type() WalEntryType {
 	return WriteWALEntryType
 }
 
@@ -476,8 +649,8 @@ func (w *DeleteWALEntry) UnmarshalBinary(b []byte) error {
 func (w *DeleteWALEntry) Encode(dst []byte) ([]byte, error) {
 	var n int
 	for _, k := range w.Keys {
-		if len(dst)+1 > len(dst)-n {
-			grow := make([]byte, defaultBufLen)
+		if len(dst[:n])+1+len(k) > len(dst) {
+			grow := make([]byte, len(dst)*2)
 			dst = append(dst, grow...)
 		}
 
@@ -490,13 +663,12 @@ func (w *DeleteWALEntry) Encode(dst []byte) ([]byte, error) {
 	return []byte(dst[:n-1]), nil
 }
 
-func (w *DeleteWALEntry) Type() walEntryType {
+func (w *DeleteWALEntry) Type() WalEntryType {
 	return DeleteWALEntryType
 }
 
 // WALSegmentWriter writes WAL segments.
 type WALSegmentWriter struct {
-	mu   sync.RWMutex
 	w    io.WriteCloser
 	size int
 }
@@ -507,69 +679,41 @@ func NewWALSegmentWriter(w io.WriteCloser) *WALSegmentWriter {
 	}
 }
 
-func (w *WALSegmentWriter) Path() string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
+func (w *WALSegmentWriter) path() string {
 	if f, ok := w.w.(*os.File); ok {
 		return f.Name()
 	}
 	return ""
 }
 
-func (w *WALSegmentWriter) Write(e WALEntry) error {
-	bytes := make([]byte, defaultBufLen)
+func (w *WALSegmentWriter) Write(entryType WalEntryType, compressed []byte) error {
 
-	b, err := e.Encode(bytes)
-	if err != nil {
+	var buf [5]byte
+	buf[0] = byte(entryType)
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(compressed)))
+
+	if _, err := w.w.Write(buf[:]); err != nil {
 		return err
 	}
 
-	compressed := snappy.Encode(b, b)
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if _, err := w.w.Write([]byte{byte(e.Type())}); err != nil {
+	if _, err := w.w.Write(compressed); err != nil {
 		return err
 	}
 
-	if _, err = w.w.Write(u32tob(uint32(len(compressed)))); err != nil {
-		return err
-	}
-
-	if _, err = w.w.Write(compressed); err != nil {
-		return err
-	}
-
-	// 5 is the 1 byte type + 4 byte uint32 length
-	w.size += len(compressed) + 5
+	w.size += len(buf) + len(compressed)
 
 	return nil
 }
 
 // Sync flushes the file systems in-memory copy of recently written data to disk.
-func (w *WALSegmentWriter) Sync() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
+func (w *WALSegmentWriter) sync() error {
 	if f, ok := w.w.(*os.File); ok {
 		return f.Sync()
 	}
 	return nil
 }
 
-func (w *WALSegmentWriter) Size() int {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	return w.size
-}
-
-func (w *WALSegmentWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
+func (w *WALSegmentWriter) close() error {
 	return w.w.Close()
 }
 
@@ -577,6 +721,7 @@ func (w *WALSegmentWriter) Close() error {
 type WALSegmentReader struct {
 	r     io.ReadCloser
 	entry WALEntry
+	n     int64
 	err   error
 }
 
@@ -590,9 +735,10 @@ func NewWALSegmentReader(r io.ReadCloser) *WALSegmentReader {
 func (r *WALSegmentReader) Next() bool {
 	b := getBuf(defaultBufLen)
 	defer putBuf(b)
+	var nReadOK int
 
 	// read the type and the length of the entry
-	_, err := io.ReadFull(r.r, b[:5])
+	n, err := io.ReadFull(r.r, b[:5])
 	if err == io.EOF {
 		return false
 	}
@@ -603,34 +749,39 @@ func (r *WALSegmentReader) Next() bool {
 		// will return the this error to be handled.
 		return true
 	}
+	nReadOK += n
 
 	entryType := b[0]
-	length := btou32(b[1:5])
+	length := binary.BigEndian.Uint32(b[1:5])
 
 	// read the compressed block and decompress it
 	if int(length) > len(b) {
 		b = make([]byte, length)
 	}
 
-	_, err = io.ReadFull(r.r, b[:length])
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		r.err = err
-		return true
-	}
-
+	n, err = io.ReadFull(r.r, b[:length])
 	if err != nil {
 		r.err = err
 		return true
 	}
+	nReadOK += n
 
-	data, err := snappy.Decode(nil, b[:length])
+	decLen, err := snappy.DecodedLen(b[:length])
+	if err != nil {
+		r.err = err
+		return true
+	}
+	decBuf := getBuf(decLen)
+	defer putBuf(decBuf)
+
+	data, err := snappy.Decode(decBuf, b[:length])
 	if err != nil {
 		r.err = err
 		return true
 	}
 
 	// and marshal it and send it to the cache
-	switch walEntryType(entryType) {
+	switch WalEntryType(entryType) {
 	case WriteWALEntryType:
 		r.entry = &WriteWALEntry{
 			Values: map[string][]Value{},
@@ -642,6 +793,10 @@ func (r *WALSegmentReader) Next() bool {
 		return true
 	}
 	r.err = r.entry.UnmarshalBinary(data)
+	if r.err == nil {
+		// Read and decode of this entry was successful.
+		r.n += int64(nReadOK)
+	}
 
 	return true
 }
@@ -651,6 +806,13 @@ func (r *WALSegmentReader) Read() (WALEntry, error) {
 		return nil, r.err
 	}
 	return r.entry, nil
+}
+
+// Count returns the total number of bytes read successfully from the segment, as
+// of the last call to Read(). The segment is guaranteed to be valid up to and
+// including this number of bytes.
+func (r *WALSegmentReader) Count() int64 {
+	return r.n
 }
 
 func (r *WALSegmentReader) Error() error {

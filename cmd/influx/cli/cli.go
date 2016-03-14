@@ -1,9 +1,10 @@
-package cli
+package cli // import "github.com/influxdata/influxdb/cmd/influx/cli"
 
 import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,15 +19,18 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/importer/v8"
+	"github.com/influxdata/influxdb/client"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/importer/v8"
 	"github.com/peterh/liner"
 )
 
 const (
 	noTokenMsg = "Visit https://enterprise.influxdata.com to register for updates, InfluxDB server management, and monitoring.\n"
 )
+
+// ErrBlankCommand is returned when a parsed command is empty.
+var ErrBlankCommand = errors.New("empty input")
 
 // CommandLine holds CLI configuration and state
 type CommandLine struct {
@@ -38,6 +42,7 @@ type CommandLine struct {
 	Password         string
 	Database         string
 	Ssl              bool
+	UnsafeSsl        bool
 	RetentionPolicy  string
 	ClientVersion    string
 	ServerVersion    string
@@ -52,8 +57,9 @@ type CommandLine struct {
 	Path             string
 	Compressed       bool
 	Quit             chan struct{}
+	IgnoreSignals    bool // Ignore signals normally caught by this process (used primarily for testing)
 	osSignals        chan os.Signal
-	historyFile      *os.File
+	historyFilePath  string
 }
 
 // New returns an instance of CommandLine
@@ -66,9 +72,11 @@ func New(version string) *CommandLine {
 }
 
 // Run executes the CLI
-func (c *CommandLine) Run() {
+func (c *CommandLine) Run() error {
 	// register OS signals for graceful termination
-	signal.Notify(c.osSignals, os.Kill, os.Interrupt, syscall.SIGTERM)
+	if !c.IgnoreSignals {
+		signal.Notify(c.osSignals, os.Kill, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	}
 
 	var promptForPassword bool
 	// determine if they set the password flag but provided no value
@@ -95,17 +103,18 @@ func (c *CommandLine) Run() {
 	}
 
 	if err := c.Connect(""); err != nil {
-		fmt.Fprintf(os.Stderr,
-			"Failed to connect to %s\nPlease check your connection settings and ensure 'influxd' is running.\n",
+		return fmt.Errorf(
+			"Failed to connect to %s\nPlease check your connection settings and ensure 'influxd' is running.",
 			c.Client.Addr())
-		return
 	}
+
+	// Modify precision.
+	c.SetPrecision(c.Precision)
 
 	if c.Execute == "" && !c.Import {
 		token, err := c.DatabaseToken()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to check token: %s\n", err.Error())
-			return
+			return fmt.Errorf("Failed to check token: %s", err.Error())
 		}
 		if token == "" {
 			fmt.Printf(noTokenMsg)
@@ -114,22 +123,24 @@ func (c *CommandLine) Run() {
 	}
 
 	if c.Execute != "" {
-		// Modify precision before executing query
-		c.SetPrecision(c.Precision)
-		if err := c.ExecuteQuery(c.Execute); err != nil {
-			c.Line.Close()
-			os.Exit(1)
+		// Make the non-interactive mode send everything through the CLI's parser
+		// the same way the interactive mode works
+		lines := strings.Split(c.Execute, "\n")
+		for _, line := range lines {
+			if err := c.ParseCommand(line); err != nil {
+				return err
+			}
 		}
+
 		c.Line.Close()
-		os.Exit(0)
+		return nil
 	}
 
 	if c.Import {
 		path := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 		u, e := client.ParseConnectionString(path, c.Ssl)
 		if e != nil {
-			fmt.Println(e)
-			return
+			return e
 		}
 
 		config := v8.NewConfig()
@@ -146,24 +157,23 @@ func (c *CommandLine) Run() {
 
 		i := v8.NewImporter(config)
 		if err := i.Import(); err != nil {
-			fmt.Printf("ERROR: %s\n", err)
+			err = fmt.Errorf("ERROR: %s\n", err)
 			c.Line.Close()
-			os.Exit(1)
+			return err
 		}
 		c.Line.Close()
-		os.Exit(0)
+		return nil
 	}
 
 	c.Version()
 
-	var historyFilePath string
 	usr, err := user.Current()
 	// Only load/write history if we can get the user
 	if err == nil {
-		historyFilePath = filepath.Join(usr.HomeDir, ".influx_history")
-		if c.historyFile, err = os.OpenFile(historyFilePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640); err == nil {
-			defer c.historyFile.Close()
-			c.Line.ReadHistory(c.historyFile)
+		c.historyFilePath = filepath.Join(usr.HomeDir, ".influx_history")
+		if historyFile, err := os.Open(c.historyFilePath); err == nil {
+			c.Line.ReadHistory(historyFile)
+			historyFile.Close()
 		}
 	}
 
@@ -174,36 +184,37 @@ func (c *CommandLine) Run() {
 			close(c.Quit)
 		case <-c.Quit:
 			c.exit()
+			return nil
 		default:
 			l, e := c.Line.Prompt("> ")
-			if e != nil {
+			if e == io.EOF {
+				// Instead of die, register that someone exited the program gracefully
+				l = "exit"
+			} else if e != nil {
 				break
 			}
-			if c.ParseCommand(l) {
+			if err := c.ParseCommand(l); err != ErrBlankCommand {
 				c.Line.AppendHistory(l)
-				_, err := c.Line.WriteHistory(c.historyFile)
-				if err != nil {
-					fmt.Printf("There was an error writing history file: %s\n", err)
-				}
+				c.saveHistory()
 			}
 		}
 	}
 }
 
 // ParseCommand parses an instruction and calls related method, if any
-func (c *CommandLine) ParseCommand(cmd string) bool {
+func (c *CommandLine) ParseCommand(cmd string) error {
 	lcmd := strings.TrimSpace(strings.ToLower(cmd))
 	tokens := strings.Fields(lcmd)
 
 	if len(tokens) > 0 {
 		switch tokens[0] {
-		case "exit":
+		case "exit", "quit":
 			// signal the program to exit
 			close(c.Quit)
 		case "gopher":
 			c.gopher()
 		case "connect":
-			c.Connect(cmd)
+			return c.Connect(cmd)
 		case "auth":
 			c.SetAuth(cmd)
 		case "help":
@@ -228,14 +239,14 @@ func (c *CommandLine) ParseCommand(cmd string) bool {
 		case "use":
 			c.use(cmd)
 		case "insert":
-			c.Insert(cmd)
+			return c.Insert(cmd)
 		default:
-			c.ExecuteQuery(cmd)
+			return c.ExecuteQuery(cmd)
 		}
 
-		return true
+		return nil
 	}
-	return false
+	return ErrBlankCommand
 }
 
 // Connect connects client to a server
@@ -263,6 +274,7 @@ func (c *CommandLine) Connect(cmd string) error {
 	config.Password = c.Password
 	config.UserAgent = "InfluxDBShell/" + c.ClientVersion
 	config.Precision = c.Precision
+	config.UnsafeSsl = c.UnsafeSsl
 	cl, err := client.NewClient(config)
 	if err != nil {
 		return fmt.Errorf("Could not create client %s", err)
@@ -318,8 +330,42 @@ func (c *CommandLine) use(cmd string) {
 		return
 	}
 	d := args[1]
-	c.Database = d
-	fmt.Printf("Using database %s\n", d)
+
+	// validate if specified database exists
+	response, err := c.Client.Query(client.Query{Command: "SHOW DATABASES"})
+	if err != nil {
+		fmt.Printf("ERR: %s\n", err)
+		return
+	}
+
+	if err := response.Error(); err != nil {
+		fmt.Printf("ERR: %s\n", err)
+		return
+	}
+
+	// verify the provided database exists
+	databaseExists := func() bool {
+		for _, result := range response.Results {
+			for _, row := range result.Series {
+				if row.Name == "databases" {
+					for _, values := range row.Values {
+						for _, database := range values {
+							if database == d {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+		return false
+	}()
+	if databaseExists {
+		c.Database = d
+		fmt.Printf("Using database %s\n", d)
+	} else {
+		fmt.Printf("ERR: Database %s doesn't exist. Run SHOW DATABASES for a list of existing databases.\n", d)
+	}
 }
 
 // SetPrecision sets client precision
@@ -686,14 +732,14 @@ func (c *CommandLine) help() {
 	fmt.Println(`Usage:
         connect <host:port>   connects to another node specified by host:port
         auth                  prompts for username and password
-        pretty                toggles pretty print for the json format	 
+        pretty                toggles pretty print for the json format
         use <db_name>         sets current database
         format <format>       specifies the format of the server responses: json, csv, or column
         precision <format>    specifies the format of the timestamp: rfc3339, h, m, s, ms, u or ns
         consistency <level>   sets write consistency level: any, one, quorum, or all
         history               displays command history
         settings              outputs the current settings for the shell
-        exit                  quits the influx shell
+        exit/quit/ctrl+d      quits the influx shell
 
         show databases        show database names
         show series           show series information
@@ -702,7 +748,7 @@ func (c *CommandLine) help() {
         show field keys       show field key information
 
         A full list of influxql commands can be found at:
-        https://influxdb.com/docs/v0.9/query_language/spec.html
+        https://docs.influxdata.com/influxdb/v0.10/query_language/spec
 `)
 }
 
@@ -710,6 +756,15 @@ func (c *CommandLine) history() {
 	var buf bytes.Buffer
 	c.Line.WriteHistory(&buf)
 	fmt.Print(buf.String())
+}
+
+func (c *CommandLine) saveHistory() {
+	if historyFile, err := os.Create(c.historyFilePath); err != nil {
+		fmt.Printf("There was an error writing history file: %s\n", err)
+	} else {
+		c.Line.WriteHistory(historyFile)
+		historyFile.Close()
+	}
 }
 
 func (c *CommandLine) gopher() {
@@ -776,13 +831,8 @@ func (c *CommandLine) Version() {
 
 func (c *CommandLine) exit() {
 	// write to history file
-	_, err := c.Line.WriteHistory(c.historyFile)
-	if err != nil {
-		fmt.Printf("There was an error writing history file: %s\n", err)
-	}
+	c.saveHistory()
 	// release line resources
 	c.Line.Close()
 	c.Line = nil
-	// exit CLI
-	os.Exit(0)
 }

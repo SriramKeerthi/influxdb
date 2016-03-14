@@ -11,10 +11,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/influxdb/influxdb/services/copier"
-	"github.com/influxdb/influxdb/tcp"
-	"github.com/influxdb/influxdb/tsdb"
-	_ "github.com/influxdb/influxdb/tsdb/engine"
+	"github.com/influxdata/influxdb/services/copier"
+	"github.com/influxdata/influxdb/tcp"
+	"github.com/influxdata/influxdb/tsdb"
+	_ "github.com/influxdata/influxdb/tsdb/engine"
 )
 
 // Ensure the service can return shard data.
@@ -163,7 +163,7 @@ func MustOpenShard(id uint64) *Shard {
 
 	sh := &Shard{
 		Shard: tsdb.NewShard(id,
-			tsdb.NewDatabaseIndex(),
+			tsdb.NewDatabaseIndex("db"),
 			filepath.Join(path, "data"),
 			filepath.Join(path, "wal"),
 			tsdb.NewEngineOptions(),

@@ -1,4 +1,4 @@
-package opentsdb
+package opentsdb // import "github.com/influxdata/influxdb/services/opentsdb"
 
 import (
 	"bufio"
@@ -16,11 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 const leaderWaitTimeout = 30 * time.Second
@@ -42,6 +42,7 @@ const (
 	statBatchesTransmitFail      = "batchesTxFail"
 	statConnectionsActive        = "connsActive"
 	statConnectionsHandled       = "connsHandled"
+	statDroppedPointsInvalid     = "droppedPointsInvalid"
 )
 
 // Service manages the listener and handler for an HTTP endpoint.
@@ -64,9 +65,8 @@ type Service struct {
 	PointsWriter interface {
 		WritePoints(p *cluster.WritePointsRequest) error
 	}
-	MetaStore interface {
-		WaitForLeader(d time.Duration) error
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+	MetaClient interface {
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
 	}
 
 	// Points received over the telnet protocol are batched.
@@ -118,12 +118,7 @@ func (s *Service) Open() error {
 	tags := map[string]string{"bind": s.BindAddress}
 	s.statMap = influxdb.NewStatistics(key, "opentsdb", tags)
 
-	if err := s.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
-		s.Logger.Printf("Failed to detect a cluster leader: %s", err.Error())
-		return err
-	}
-
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.Database); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(s.Database); err != nil {
 		s.Logger.Printf("Failed to ensure target database %s exists: %s", s.Database, err.Error())
 		return err
 	}
@@ -367,6 +362,7 @@ func (s *Service) serveHTTP() {
 		ConsistencyLevel: s.ConsistencyLevel,
 		PointsWriter:     s.PointsWriter,
 		Logger:           s.Logger,
+		statMap:          s.statMap,
 	}}
 	srv.Serve(s.httpln)
 }

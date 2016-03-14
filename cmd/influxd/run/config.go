@@ -11,32 +11,39 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/monitor"
-	"github.com/influxdb/influxdb/services/admin"
-	"github.com/influxdb/influxdb/services/collectd"
-	"github.com/influxdb/influxdb/services/continuous_querier"
-	"github.com/influxdb/influxdb/services/graphite"
-	"github.com/influxdb/influxdb/services/hh"
-	"github.com/influxdb/influxdb/services/httpd"
-	"github.com/influxdb/influxdb/services/opentsdb"
-	"github.com/influxdb/influxdb/services/precreator"
-	"github.com/influxdb/influxdb/services/registration"
-	"github.com/influxdb/influxdb/services/retention"
-	"github.com/influxdb/influxdb/services/subscriber"
-	"github.com/influxdb/influxdb/services/udp"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/monitor"
+	"github.com/influxdata/influxdb/services/admin"
+	"github.com/influxdata/influxdb/services/collectd"
+	"github.com/influxdata/influxdb/services/continuous_querier"
+	"github.com/influxdata/influxdb/services/graphite"
+	"github.com/influxdata/influxdb/services/hh"
+	"github.com/influxdata/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/services/opentsdb"
+	"github.com/influxdata/influxdb/services/precreator"
+	"github.com/influxdata/influxdb/services/retention"
+	"github.com/influxdata/influxdb/services/subscriber"
+	"github.com/influxdata/influxdb/services/udp"
+	"github.com/influxdata/influxdb/tsdb"
+)
+
+const (
+	// DefaultBindAddress is the default address for raft, cluster, snapshot, etc..
+	DefaultBindAddress = ":8088"
+
+	// DefaultHostname is the default hostname used if we are unable to determine
+	// the hostname from the system
+	DefaultHostname = "localhost"
 )
 
 // Config represents the configuration format for the influxd binary.
 type Config struct {
-	Meta         *meta.Config        `toml:"meta"`
-	Data         tsdb.Config         `toml:"data"`
-	Cluster      cluster.Config      `toml:"cluster"`
-	Retention    retention.Config    `toml:"retention"`
-	Registration registration.Config `toml:"registration"`
-	Precreator   precreator.Config   `toml:"shard-precreation"`
+	Meta       *meta.Config      `toml:"meta"`
+	Data       tsdb.Config       `toml:"data"`
+	Cluster    cluster.Config    `toml:"cluster"`
+	Retention  retention.Config  `toml:"retention"`
+	Precreator precreator.Config `toml:"shard-precreation"`
 
 	Admin      admin.Config      `toml:"admin"`
 	Monitor    monitor.Config    `toml:"monitor"`
@@ -47,13 +54,20 @@ type Config struct {
 	OpenTSDB   opentsdb.Config   `toml:"opentsdb"`
 	UDPs       []udp.Config      `toml:"udp"`
 
-	// Snapshot SnapshotConfig `toml:"snapshot"`
 	ContinuousQuery continuous_querier.Config `toml:"continuous_queries"`
-
-	HintedHandoff hh.Config `toml:"hinted-handoff"`
+	HintedHandoff   hh.Config                 `toml:"hinted-handoff"`
 
 	// Server reporting
 	ReportingDisabled bool `toml:"reporting-disabled"`
+
+	// BindAddress is the address that all TCP services use (Raft, Snapshot, Cluster, etc.)
+	BindAddress string `toml:"bind-address"`
+
+	// Hostname is the hostname portion to use when registering local
+	// addresses.  This hostname must be resolvable from other nodes.
+	Hostname string `toml:"hostname"`
+
+	Join string `toml:"join"`
 }
 
 // NewConfig returns an instance of Config with reasonable defaults.
@@ -62,7 +76,6 @@ func NewConfig() *Config {
 	c.Meta = meta.NewConfig()
 	c.Data = tsdb.NewConfig()
 	c.Cluster = cluster.NewConfig()
-	c.Registration = registration.NewConfig()
 	c.Precreator = precreator.NewConfig()
 
 	c.Admin = admin.NewConfig()
@@ -75,13 +88,32 @@ func NewConfig() *Config {
 	c.ContinuousQuery = continuous_querier.NewConfig()
 	c.Retention = retention.NewConfig()
 	c.HintedHandoff = hh.NewConfig()
+	c.BindAddress = DefaultBindAddress
+
+	// All ARRAY attributes have to be init after toml decode
+	// See: https://github.com/BurntSushi/toml/pull/68
+	// Those attributes will be initialized in Config.InitTableAttrs method
+	// Concerned Attributes:
+	//  * `c.Graphites`
+	//  * `c.UDPs`
 
 	return c
+}
+
+// InitTableAttrs initialises all ARRAY attributes if empty
+func (c *Config) InitTableAttrs() {
+	if len(c.UDPs) == 0 {
+		c.UDPs = []udp.Config{udp.NewConfig()}
+	}
+	if len(c.Graphites) == 0 {
+		c.Graphites = []graphite.Config{graphite.NewConfig()}
+	}
 }
 
 // NewDemoConfig returns the config that runs when no config is specified.
 func NewDemoConfig() (*Config, error) {
 	c := NewConfig()
+	c.InitTableAttrs()
 
 	var homeDir string
 	// By default, store meta and data files in current users home directory
@@ -107,21 +139,37 @@ func NewDemoConfig() (*Config, error) {
 
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
-	if c.Meta.Dir == "" {
-		return errors.New("Meta.Dir must be specified")
-	} else if c.HintedHandoff.Enabled && c.HintedHandoff.Dir == "" {
-		return errors.New("HintedHandoff.Dir must be specified")
+	if !c.Meta.Enabled && !c.Data.Enabled {
+		return errors.New("either Meta, Data, or both must be enabled")
 	}
 
-	if err := c.Data.Validate(); err != nil {
-		return err
-	}
+	if c.Meta.Enabled {
+		if err := c.Meta.Validate(); err != nil {
+			return err
+		}
 
-	for _, g := range c.Graphites {
-		if err := g.Validate(); err != nil {
-			return fmt.Errorf("invalid graphite config: %v", err)
+		// If the config is for a meta-only node, we can't store monitor stats
+		// locally.
+		if c.Monitor.StoreEnabled && !c.Data.Enabled {
+			return fmt.Errorf("monitor storage can not be enabled on meta only nodes")
 		}
 	}
+
+	if c.Data.Enabled {
+		if err := c.Data.Validate(); err != nil {
+			return err
+		}
+
+		if err := c.HintedHandoff.Validate(); err != nil {
+			return err
+		}
+		for _, g := range c.Graphites {
+			if err := g.Validate(); err != nil {
+				return fmt.Errorf("invalid graphite config: %v", err)
+			}
+		}
+	}
+
 	return nil
 }
 

@@ -3,7 +3,7 @@
 SWAKS="/root/swaks"
 
 # Bump this whenever a release branch is created from master
-MASTER_VERSION=0.9.6
+MASTER_VERSION=0.10.0
 
 # send_failure_notification sends an e-mail with a build failure notification.
 function send_failure_notification {
@@ -41,11 +41,11 @@ echo "Using $REPO_DIR for all work..."
 
 cd $REPO_DIR
 export GOPATH=`pwd`
-mkdir -p $GOPATH/src/github.com/influxdb
-cd $GOPATH/src/github.com/influxdb
-git clone https://github.com/influxdb/influxdb.git
+mkdir -p $GOPATH/src/github.com/influxdata
+cd $GOPATH/src/github.com/influxdata
+git clone https://github.com/influxdata/influxdb.git
 
-cd $GOPATH/src/github.com/influxdb/influxdb
+cd $GOPATH/src/github.com/influxdata/influxdb
 VERSION="$MASTER_VERSION-nightly-`git log --pretty=format:'%h' -n 1`"
 NIGHTLY_BUILD=true ./package.sh $race $VERSION
 

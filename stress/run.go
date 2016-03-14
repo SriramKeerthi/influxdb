@@ -1,4 +1,4 @@
-package stress
+package stress // import "github.com/influxdata/influxdb/stress"
 
 import (
 	"bytes"
@@ -7,15 +7,6 @@ import (
 	"sync"
 	"time"
 )
-
-// Run handles the logic for running a stress test given a config file
-func Run(c *Config) {
-	w := NewWriter(&c.Write.PointGenerators.Basic, &c.Write.InfluxClients.Basic)
-	r := NewQuerier(&c.Read.QueryGenerators.Basic, &c.Read.QueryClients.Basic)
-	s := NewStressTest(&c.Provision.Basic, w, r)
-
-	s.Start(BasicWriteHandler, BasicReadHandler)
-}
 
 // Point is an interface that is used to represent
 // the abstract idea of a point in InfluxDB.

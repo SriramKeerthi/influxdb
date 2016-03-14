@@ -1,4 +1,4 @@
-package graphite
+package graphite // import "github.com/influxdata/influxdb/services/graphite"
 
 import (
 	"bufio"
@@ -12,11 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/monitor"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/monitor/diagnostics"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 const (
@@ -47,6 +47,7 @@ func (c *tcpConnection) Close() {
 	c.conn.Close()
 }
 
+// Service represents a Graphite service.
 type Service struct {
 	mu sync.Mutex
 
@@ -66,6 +67,7 @@ type Service struct {
 	statMap          *expvar.Map
 	tcpConnectionsMu sync.Mutex
 	tcpConnections   map[string]*tcpConnection
+	diagsKey         string
 
 	ln      net.Listener
 	addr    net.Addr
@@ -75,15 +77,14 @@ type Service struct {
 	done chan struct{}
 
 	Monitor interface {
-		RegisterDiagnosticsClient(name string, client monitor.DiagsClient)
+		RegisterDiagnosticsClient(name string, client diagnostics.Client)
 		DeregisterDiagnosticsClient(name string)
 	}
 	PointsWriter interface {
 		WritePoints(p *cluster.WritePointsRequest) error
 	}
-	MetaStore interface {
-		WaitForLeader(d time.Duration) error
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+	MetaClient interface {
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
 	}
 }
 
@@ -103,6 +104,7 @@ func NewService(c Config) (*Service, error) {
 		logger:         log.New(os.Stderr, "[graphite] ", log.LstdFlags),
 		tcpConnections: make(map[string]*tcpConnection),
 		done:           make(chan struct{}),
+		diagsKey:       strings.Join([]string{"graphite", d.Protocol, d.BindAddress}, ":"),
 	}
 
 	consistencyLevel, err := cluster.ParseConsistencyLevel(d.ConsistencyLevel)
@@ -133,21 +135,15 @@ func (s *Service) Open() error {
 
 	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
 	// should be done before any data could arrive for the service.
-	key := strings.Join([]string{"graphite", s.protocol, s.bindAddress}, ":")
 	tags := map[string]string{"proto": s.protocol, "bind": s.bindAddress}
-	s.statMap = influxdb.NewStatistics(key, "graphite", tags)
+	s.statMap = influxdb.NewStatistics(s.diagsKey, "graphite", tags)
 
 	// Register diagnostics if a Monitor service is available.
 	if s.Monitor != nil {
-		s.Monitor.RegisterDiagnosticsClient(key, s)
+		s.Monitor.RegisterDiagnosticsClient(s.diagsKey, s)
 	}
 
-	if err := s.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
-		s.logger.Printf("Failed to detect a cluster leader: %s", err.Error())
-		return err
-	}
-
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.database); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(s.database); err != nil {
 		s.logger.Printf("Failed to ensure target database %s exists: %s", s.database, err.Error())
 		return err
 	}
@@ -199,6 +195,11 @@ func (s *Service) Close() error {
 	if s.batcher != nil {
 		s.batcher.Stop()
 	}
+
+	if s.Monitor != nil {
+		s.Monitor.DeregisterDiagnosticsClient(s.diagsKey)
+	}
+
 	close(s.done)
 	s.wg.Wait()
 	s.done = nil
@@ -211,6 +212,7 @@ func (s *Service) SetLogger(l *log.Logger) {
 	s.logger = l
 }
 
+// Addr returns the address the Service binds to.
 func (s *Service) Addr() net.Addr {
 	return s.addr
 }
@@ -337,7 +339,7 @@ func (s *Service) handleLine(line string) {
 	point, err := s.parser.Parse(line)
 	if err != nil {
 		switch err := err.(type) {
-		case *ErrUnsupportedValue:
+		case *UnsupportedValueError:
 			// Graphite ignores NaN values with no error.
 			if math.IsNaN(err.Value) {
 				s.statMap.Add(statPointsNaNFail, 1)
@@ -377,16 +379,16 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 	}
 }
 
-func (s *Service) Diagnostics() (*monitor.Diagnostic, error) {
+// Diagnostics returns diagnostics of the graphite service.
+func (s *Service) Diagnostics() (*diagnostics.Diagnostics, error) {
 	s.tcpConnectionsMu.Lock()
 	defer s.tcpConnectionsMu.Unlock()
 
-	d := &monitor.Diagnostic{
+	d := &diagnostics.Diagnostics{
 		Columns: []string{"local", "remote", "connect time"},
 		Rows:    make([][]interface{}, 0, len(s.tcpConnections)),
 	}
 	for _, v := range s.tcpConnections {
-		_ = v
 		d.Rows = append(d.Rows, []interface{}{v.conn.LocalAddr().String(), v.conn.RemoteAddr().String(), v.connectTime})
 	}
 	return d, nil

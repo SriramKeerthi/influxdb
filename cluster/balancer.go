@@ -3,7 +3,7 @@ package cluster
 import (
 	"math/rand"
 
-	"github.com/influxdb/influxdb/meta"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 // Balancer represents a load-balancing algorithm for a set of nodes
@@ -45,15 +45,6 @@ func (b *nodeBalancer) shuffle() {
 // online returns a slice of the nodes that are online
 func (b *nodeBalancer) online() []meta.NodeInfo {
 	return b.nodes
-	// now := time.Now().UTC()
-	// up := []meta.NodeInfo{}
-	// for _, n := range b.nodes {
-	// 	if n.OfflineUntil.After(now) {
-	// 		continue
-	// 	}
-	// 	up = append(up, n)
-	// }
-	// return up
 }
 
 // Next returns the next available nodes

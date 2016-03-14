@@ -1,4 +1,4 @@
-package httpd
+package httpd // import "github.com/influxdata/influxdb/services/httpd"
 
 import (
 	"crypto/tls"
@@ -9,22 +9,28 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/influxdb/influxdb"
+	"github.com/influxdata/influxdb"
 )
 
 // statistics gathered by the httpd package.
 const (
-	statRequest                      = "req"               // Number of HTTP requests served
-	statCQRequest                    = "cqReq"             // Number of CQ-execute requests served
-	statQueryRequest                 = "queryReq"          // Number of query requests served
-	statWriteRequest                 = "writeReq"          // Number of write requests serverd
-	statPingRequest                  = "pingReq"           // Number of ping requests served
-	statWriteRequestBytesReceived    = "writeReqBytes"     // Sum of all bytes in write requests
-	statQueryRequestBytesTransmitted = "queryRespBytes"    // Sum of all bytes returned in query reponses
-	statPointsWrittenOK              = "pointsWrittenOK"   // Number of points written OK
-	statPointsWrittenFail            = "pointsWrittenFail" // Number of points that failed to be written
-	statAuthFail                     = "authFail"          // Number of authentication failures
+	statRequest                      = "req"                // Number of HTTP requests served
+	statCQRequest                    = "cqReq"              // Number of CQ-execute requests served
+	statQueryRequest                 = "queryReq"           // Number of query requests served
+	statWriteRequest                 = "writeReq"           // Number of write requests serverd
+	statPingRequest                  = "pingReq"            // Number of ping requests served
+	statStatusRequest                = "statusReq"          // Number of status requests served
+	statWriteRequestBytesReceived    = "writeReqBytes"      // Sum of all bytes in write requests
+	statQueryRequestBytesTransmitted = "queryRespBytes"     // Sum of all bytes returned in query reponses
+	statPointsWrittenOK              = "pointsWrittenOK"    // Number of points written OK
+	statPointsWrittenFail            = "pointsWrittenFail"  // Number of points that failed to be written
+	statAuthFail                     = "authFail"           // Number of authentication failures
+	statRequestDuration              = "reqDurationNs"      // Number of (wall-time) nanoseconds spent inside requests
+	statQueryRequestDuration         = "queryReqDurationNs" // Number of (wall-time) nanoseconds spent inside query requests
+	statWriteRequestDuration         = "writeReqDurationNs" // Number of (wall-time) nanoseconds spent inside write requests
+	statRequestsActive               = "reqActive"          // Number of currently active requests
 )
 
 // Service manages the listener and handler for an HTTP endpoint.
@@ -58,6 +64,7 @@ func NewService(c Config) *Service {
 			c.AuthEnabled,
 			c.LogEnabled,
 			c.WriteTracing,
+			c.JSONWriteEnabled,
 			statMap,
 		),
 		Logger: log.New(os.Stderr, "[httpd] ", log.LstdFlags),
@@ -95,6 +102,19 @@ func (s *Service) Open() error {
 
 		s.Logger.Println("Listening on HTTP:", listener.Addr().String())
 		s.ln = listener
+	}
+
+	// wait for the listeners to start
+	timeout := time.Now().Add(time.Second)
+	for {
+		if s.ln.Addr() != nil {
+			break
+		}
+
+		if time.Now().After(timeout) {
+			return fmt.Errorf("unable to open without http listener running")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Begin listening for requests in a separate goroutine.

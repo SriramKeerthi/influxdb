@@ -7,14 +7,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
 )
+
+// TODO(benbjohnson): Rewrite tests to use cluster_test.MetaClient.
 
 // Ensures the points writer maps a single point to a single shard.
 func TestPointsWriter_MapShards_One(t *testing.T) {
-	ms := MetaStore{}
+	ms := PointsWriterMetaClient{}
 	rp := NewRetentionPolicy("myp", time.Hour, 3)
 
 	ms.NodeIDFn = func() uint64 { return 1 }
@@ -26,7 +29,7 @@ func TestPointsWriter_MapShards_One(t *testing.T) {
 		return &rp.ShardGroups[0], nil
 	}
 
-	c := cluster.PointsWriter{MetaStore: ms}
+	c := cluster.PointsWriter{MetaClient: ms}
 	pr := &cluster.WritePointsRequest{
 		Database:         "mydb",
 		RetentionPolicy:  "myrp",
@@ -49,7 +52,7 @@ func TestPointsWriter_MapShards_One(t *testing.T) {
 
 // Ensures the points writer maps a multiple points across shard group boundaries.
 func TestPointsWriter_MapShards_Multiple(t *testing.T) {
-	ms := MetaStore{}
+	ms := PointsWriterMetaClient{}
 	rp := NewRetentionPolicy("myp", time.Hour, 3)
 	AttachShardGroupInfo(rp, []meta.ShardOwner{
 		{NodeID: 1},
@@ -76,7 +79,7 @@ func TestPointsWriter_MapShards_Multiple(t *testing.T) {
 		panic("should not get here")
 	}
 
-	c := cluster.PointsWriter{MetaStore: ms}
+	c := cluster.PointsWriter{MetaClient: ms}
 	pr := &cluster.WritePointsRequest{
 		Database:         "mydb",
 		RetentionPolicy:  "myrp",
@@ -303,7 +306,7 @@ func TestPointsWriter_WritePoints(t *testing.T) {
 			},
 		}
 
-		ms := NewMetaStore()
+		ms := NewPointsWriterMetaClient()
 		ms.DatabaseFn = func(database string) (*meta.DatabaseInfo, error) {
 			return nil, nil
 		}
@@ -316,11 +319,12 @@ func TestPointsWriter_WritePoints(t *testing.T) {
 		}
 
 		c := cluster.NewPointsWriter()
-		c.MetaStore = ms
+		c.MetaClient = ms
 		c.ShardWriter = sw
 		c.TSDBStore = store
 		c.HintedHandoff = hh
 		c.Subscriber = sub
+		c.Node = &influxdb.Node{ID: 1}
 
 		c.Open()
 		defer c.Close()
@@ -372,8 +376,8 @@ func (f *fakeStore) CreateShard(database, retentionPolicy string, shardID uint64
 	return f.CreateShardfn(database, retentionPolicy, shardID)
 }
 
-func NewMetaStore() *MetaStore {
-	ms := &MetaStore{}
+func NewPointsWriterMetaClient() *PointsWriterMetaClient {
+	ms := &PointsWriterMetaClient{}
 	rp := NewRetentionPolicy("myp", time.Hour, 3)
 	AttachShardGroupInfo(rp, []meta.ShardOwner{
 		{NodeID: 1},
@@ -401,7 +405,7 @@ func NewMetaStore() *MetaStore {
 	return ms
 }
 
-type MetaStore struct {
+type PointsWriterMetaClient struct {
 	NodeIDFn                      func() uint64
 	RetentionPolicyFn             func(database, name string) (*meta.RetentionPolicyInfo, error)
 	CreateShardGroupIfNotExistsFn func(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error)
@@ -409,21 +413,21 @@ type MetaStore struct {
 	ShardOwnerFn                  func(shardID uint64) (string, string, *meta.ShardGroupInfo)
 }
 
-func (m MetaStore) NodeID() uint64 { return m.NodeIDFn() }
+func (m PointsWriterMetaClient) NodeID() uint64 { return m.NodeIDFn() }
 
-func (m MetaStore) RetentionPolicy(database, name string) (*meta.RetentionPolicyInfo, error) {
+func (m PointsWriterMetaClient) RetentionPolicy(database, name string) (*meta.RetentionPolicyInfo, error) {
 	return m.RetentionPolicyFn(database, name)
 }
 
-func (m MetaStore) CreateShardGroupIfNotExists(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error) {
+func (m PointsWriterMetaClient) CreateShardGroup(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error) {
 	return m.CreateShardGroupIfNotExistsFn(database, policy, timestamp)
 }
 
-func (m MetaStore) Database(database string) (*meta.DatabaseInfo, error) {
+func (m PointsWriterMetaClient) Database(database string) (*meta.DatabaseInfo, error) {
 	return m.DatabaseFn(database)
 }
 
-func (m MetaStore) ShardOwner(shardID uint64) (string, string, *meta.ShardGroupInfo) {
+func (m PointsWriterMetaClient) ShardOwner(shardID uint64) (string, string, *meta.ShardGroupInfo) {
 	return m.ShardOwnerFn(shardID)
 }
 

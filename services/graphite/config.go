@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
@@ -51,9 +51,9 @@ const (
 
 // Config represents the configuration for Graphite endpoints.
 type Config struct {
+	Enabled          bool          `toml:"enabled"`
 	BindAddress      string        `toml:"bind-address"`
 	Database         string        `toml:"database"`
-	Enabled          bool          `toml:"enabled"`
 	Protocol         string        `toml:"protocol"`
 	BatchSize        int           `toml:"batch-size"`
 	BatchPending     int           `toml:"batch-pending"`
@@ -63,6 +63,20 @@ type Config struct {
 	Tags             []string      `toml:"tags"`
 	Separator        string        `toml:"separator"`
 	UDPReadBuffer    int           `toml:"udp-read-buffer"`
+}
+
+// NewConfig returns a new instance of Config with defaults.
+func NewConfig() Config {
+	return Config{
+		BindAddress:      DefaultBindAddress,
+		Database:         DefaultDatabase,
+		Protocol:         DefaultProtocol,
+		BatchSize:        DefaultBatchSize,
+		BatchPending:     DefaultBatchPending,
+		BatchTimeout:     toml.Duration(DefaultBatchTimeout),
+		ConsistencyLevel: DefaultConsistencyLevel,
+		Separator:        DefaultSeparator,
+	}
 }
 
 // WithDefaults takes the given config and returns a new config with any required
@@ -99,6 +113,7 @@ func (c *Config) WithDefaults() *Config {
 	return &d
 }
 
+// DefaultTags returns the config's tags.
 func (c *Config) DefaultTags() models.Tags {
 	tags := models.Tags{}
 	for _, t := range c.Tags {
@@ -108,6 +123,7 @@ func (c *Config) DefaultTags() models.Tags {
 	return tags
 }
 
+// Validate validates the config's templates and tags.
 func (c *Config) Validate() error {
 	if err := c.validateTemplates(); err != nil {
 		return err
